@@ -41,15 +41,7 @@
 				['OS == "linux"',
 					{
 						'cflags_c': [ '-std=gnu11' ],
-						'variables': {
-							'USE_MUSL': '<!(ldd --version 2>&1 | head -n1 | grep "musl" | wc -l)',
-						},
-						'conditions': [
-							['<(USE_MUSL) == 1',
-								{'defines': ['CORO_ASM', '__MUSL__']},
-								{'defines': ['CORO_UCONTEXT']}
-							],
-						],
+						'defines': ['CORO_PTHREAD'],
 					},
 				],
 				['OS == "solaris" or OS == "sunos" or OS == "freebsd" or OS == "aix"', {'defines': ['CORO_UCONTEXT']}],

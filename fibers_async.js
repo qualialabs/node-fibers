@@ -1,9 +1,9 @@
 const { AsyncResource, executionAsyncResource } = require('async_hooks');
 const { timeStamp } = require('console');
-const _Fiber = require('./fibers.js');
+const _Fiber = require('./fibers_sync.js');
 
-const weakMap = new WeakMap();
-const Fiber = function Fiber(...args) {
+const weakMap = new Map();
+function Fiber(...args) {
   if (!(this instanceof Fiber)) {
     return new Fiber(...args);
   }
@@ -31,13 +31,8 @@ _Fiber[Symbol.hasInstance] = function(obj) {
 };
 
 Fiber.yield = function(...args) {
-  const _ar = Fiber.current._ar;
-  const _ar1 = executionAsyncResource();
-  const ret = _Fiber.yield(...args);
-  const _arNext = Fiber.current._ar;
-  const _arNext1 = executionAsyncResource();
-  Fiber.current._ar = _arNext1;
-  return ret;
+  return _Fiber.yield(...args);
+  // return Fiber.current._ar.runInAsyncScope(() => _Fiber.yield(...args));
 };
 
 module.exports = Fiber;
@@ -65,11 +60,21 @@ Fiber.prototype = {
     return weakMap.get(this)._fiber;
   },
 
+  get started() {
+    return this._fiber.started;
+  },
+
   run(...args) {
     return this._ar.runInAsyncScope(() => this._fiber.run(...args));
   },
 
   throwInto(...args) {
     return this._ar.runInAsyncScope(() => this._fiber.throwInto(...args));
+  },
+
+  reset(...args) {
+    return this._ar.runInAsyncScope(() => this._fiber.reset(...args));
   }
 }
+
+// _Fiber.setupAsyncHacks(Fiber);
