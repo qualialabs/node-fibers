@@ -133,5 +133,3 @@ function setupAsyncHacks(Fiber) {
 		return;
 	}
 }
-
-module.exports.setupAsyncHacks = setupAsyncHacks;
