@@ -7,14 +7,15 @@ function Fiber(fn, ...args) {
   if (!(this instanceof Fiber)) {
     return new Fiber(fn, ...args);
   }
-
-  const ar = new AsyncResource('Fiber');
-
-  const actualFn = (...fnArgs) => {
-    return ar.runInAsyncScope(() => fn(...fnArgs));
-  }
+  const actualFn = fn; /*(...fnArgs) => {
+    return globalAr.runInAsyncScope(() => {
+      const ar = new AsyncResource('Fiber');
+      return ar.runInAsyncScope(() => fn(...fnArgs));
+    });
+  };*/
   const _private = {
-    _fiber: _Fiber(actualFn, ...args)
+    _fiber: _Fiber(actualFn, ...args),
+    _ar: new AsyncResource('Fiber'),
   };
 
   weakMap.set(this, _private);
@@ -46,6 +47,10 @@ Fiber.prototype = {
 
   get started() {
     return this._fiber.started;
+  },
+
+  runInAsyncScope(fn) {
+    return weakMap.get(this)._ar.runInAsyncScope(fn);
   },
 
   run(...args) {

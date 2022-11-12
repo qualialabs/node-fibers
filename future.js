@@ -1,5 +1,5 @@
 "use strict";
-var Fiber = require('./fibers_async');
+var Fiber = require('./fibers');
 var util = require('util');
 module.exports = Future;
 Function.prototype.future = function(detach) {
