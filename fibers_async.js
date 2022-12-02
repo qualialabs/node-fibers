@@ -2,7 +2,7 @@ const { AsyncResource } = require('async_hooks');
 const aw = process.binding('async_wrap');
 const _Fiber = require('./fibers_sync.js');
 
-const weakMap = new Map();
+const weakMap = new WeakMap();
 function Fiber(fn, ...args) {
   if (!(this instanceof Fiber)) {
     return new Fiber(fn, ...args);
