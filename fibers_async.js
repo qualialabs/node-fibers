@@ -8,8 +8,9 @@ if (_Fiber.Fiber) {
 }
 const asyncResourceWeakMap = new WeakMap();
 function Fiber(fn, ...args) {
-  const _fiber = _Fiber(fn, ...args);
   const ar = new AsyncResource('Fiber');
+  const actualFn = (...args1) => ar.runInAsyncScope(() => fn(...args1));
+  const _fiber = _Fiber(actualFn, ...args);
   asyncResourceWeakMap.set(_fiber, ar);
   return _fiber;
 };
