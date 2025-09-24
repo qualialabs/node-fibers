@@ -156,7 +156,7 @@ Future.wait = function wait(/* ... */) {
 	// Resumes current fiber
 	var fiber = Fiber.current;
 	if (!fiber) {
-		throw new Error('Can\'t wait without a fiber');
+		throw new Error('Can\'t wait without a fiber. Most likely you called `Promise.await()` after calling `await somePromiseAPI()`. Read https://engdocs.qualia.io/qualia/advanced-topics/fibers');
 	}
 
 	// Resolve all futures

@@ -14,7 +14,18 @@ using namespace v8;
 
 // Handle legacy V8 API
 namespace uni {
-#if V8_AT_LEAST(5, 3)
+#if V8_AT_LEAST(10, 4)
+	// I have no idea if 10.4 is correct, I only know that from version 20 of node, this code needs to be triggered, and doing this makes it so
+	template <void (*F)(void*), class P>
+	void WeakCallbackShim(const WeakCallbackInfo<P>& data) {
+		F(data.GetParameter());
+	}
+
+	template <void (*F)(void*), class T, typename P>
+	void MakeWeak(Isolate* isolate, Persistent<T>& handle, P* val) {
+		handle.SetWeak(val, WeakCallbackShim<F, P>, WeakCallbackType::kParameter);
+	}
+#elif V8_AT_LEAST(5, 3)
 	// Actually 5.2.244
 	// ..or maybe actually 5.2.49
 	template <void (*F)(void*), class P>
