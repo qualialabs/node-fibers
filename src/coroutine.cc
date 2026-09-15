@@ -17,6 +17,11 @@
 #endif
 
 #include <stdexcept>
+#include <cstdio>
+#include <cstdlib>
+#ifndef WINDOWS
+#include <dlfcn.h>
+#endif
 #include <stack>
 #include <vector>
 using namespace std;
@@ -27,6 +32,18 @@ static pthread_key_t coro_thread_key = 0;
 static pthread_key_t isolate_key = 0x7777;
 static pthread_key_t thread_id_key = 0x7777;
 static pthread_key_t thread_data_key = 0x7777;
+
+/**
+ * Qualia's node build exports `v8_qualia_set_thread_stack_start(void*)`. V8 >= 12 records the
+ * start of the OS thread's stack when an isolate is entered and cppgc conservatively scans from
+ * the current stack pointer up to it during GC; on a coroutine stack that range is garbage. When
+ * the symbol exists we tell V8 which stack is running on every switch (nullptr = the thread's own
+ * stack). Resolved with dlsym so this addon still loads on a node without the patch.
+ */
+typedef void (*set_thread_stack_start_t)(void*);
+static set_thread_stack_start_t set_thread_stack_start = NULL;
+
+static void notify_stack_start(const Coroutine& next);
 
 static size_t stack_size = 0;
 static size_t coroutines_created_ = 0;
@@ -75,66 +92,113 @@ namespace v8 {
 }
 #endif
 
+struct tls_snapshot_t {
+	v8::Isolate* isolate;
+	std::vector<void*> values;
+};
+
+/**
+ * Runs on a fresh helper thread: enter the isolate (which makes V8 assign this thread a new
+ * ThreadId and thread data) and copy every pthread TLS slot below `coro_thread_key`.
+ */
 #ifndef WINDOWS
-static void* find_thread_id_key(void* arg)
+static void* snapshot_tls(void* arg)
 #else
-static DWORD __stdcall find_thread_id_key(LPVOID arg)
+static DWORD __stdcall snapshot_tls(LPVOID arg)
 #endif
 {
-	v8::Isolate* isolate = static_cast<v8::Isolate*>(arg);
-	assert(isolate != NULL);
-	v8::Locker locker(isolate);
-	isolate->Enter();
-
-	// First pass-- find isolate thread key
+	tls_snapshot_t* snap = static_cast<tls_snapshot_t*>(arg);
+	assert(snap->isolate != NULL);
+	v8::Locker locker(snap->isolate);
+	snap->isolate->Enter();
 #ifdef __MUSL__
 	// 128 is default max key in musl
-	for (pthread_key_t ii = 1; ii < 128; ++ii) {
+	const pthread_key_t key_count = 128;
 #else
-	for (pthread_key_t ii = coro_thread_key; ii > 0; --ii) {
+	const pthread_key_t key_count = coro_thread_key;
 #endif
-		void* tls = pthread_getspecific(ii - 1);
-		if (tls == isolate) {
+	snap->values.assign(key_count, NULL);
+	for (pthread_key_t ii = 0; ii < key_count; ++ii) {
+		snap->values[ii] = pthread_getspecific(ii);
+	}
+	snap->isolate->Exit();
+	return NULL;
+}
+
+static void take_tls_snapshot(v8::Isolate* isolate, tls_snapshot_t& snap) {
+	snap.isolate = isolate;
+	pthread_t thread;
+	pthread_create(&thread, NULL, snapshot_tls, &snap);
+	pthread_join(thread, NULL);
+}
+
+/**
+ * Locate the pthread TLS keys V8 uses for the current isolate, per-isolate thread data and
+ * ThreadId. Up to V8 12 all three were pthread keys and can be found by value (the isolate
+ * pointer, a struct whose first word is the isolate pointer, and the int thread id read from
+ * that struct). Newer V8 keeps the isolate and thread data in compiler thread_local storage
+ * (which Locker/Unlocker maintain for us), so only the ThreadId key matters: it is the slot
+ * holding a small positive int that increments between two consecutively created threads.
+ */
+static void find_thread_id_key(v8::Isolate* isolate) {
+	tls_snapshot_t a;
+	take_tls_snapshot(isolate, a);
+	const pthread_key_t key_count = a.values.size();
+
+	// First pass-- find isolate thread key
+	for (pthread_key_t ii = key_count; ii > 0; --ii) {
+		if (a.values[ii - 1] == isolate) {
 			isolate_key = ii - 1;
 			break;
 		}
 	}
-	assert(isolate_key != 0x7777);
 
 	// Second pass-- find data key
 	int thread_id = 0;
-#ifdef __MUSL__
-	for (pthread_key_t ii = 0; ii < 128; ++ii) {
-#else
-	for (pthread_key_t ii = isolate_key + 1; ii < coro_thread_key; ++ii) {
-#endif
-		void* tls = pthread_getspecific(ii);
-		if (can_poke(tls) && *(void**)tls == isolate) {
-			// First member of per-thread data is the isolate
-			thread_data_key = ii;
-			// Second member is the thread id
-			thread_id = *(int*)((void**)tls + 1);
-			break;
+	if (isolate_key != 0x7777) {
+		for (pthread_key_t ii = isolate_key + 1; ii < key_count; ++ii) {
+			void* tls = a.values[ii];
+			if (can_poke(tls) && *(void**)tls == isolate) {
+				// First member of per-thread data is the isolate
+				thread_data_key = ii;
+				// Second member is the thread id
+				thread_id = *(int*)((void**)tls + 1);
+				break;
+			}
 		}
 	}
-	assert(thread_data_key != 0x7777);
 
 	// Third pass-- find thread id key
-#ifdef __MUSL__
-	for (pthread_key_t ii = 0; ii < 128; ++ii) {
-#else
-	for (pthread_key_t ii = isolate_key + 1; ii < coro_thread_key; ++ii) {
-#endif
-		int tls = static_cast<int>(reinterpret_cast<intptr_t>(pthread_getspecific(ii)));
-		if (tls == thread_id) {
-			thread_id_key = ii;
-			break;
+	if (thread_data_key != 0x7777) {
+		for (pthread_key_t ii = isolate_key + 1; ii < key_count; ++ii) {
+			int tls = static_cast<int>(reinterpret_cast<intptr_t>(a.values[ii]));
+			if (tls == thread_id) {
+				thread_id_key = ii;
+				break;
+			}
+		}
+	}
+
+	if (thread_id_key == 0x7777) {
+		// Fallback for V8 >= 13: compare against a second helper thread. V8 hands out thread ids
+		// from an atomic counter, so the ThreadId slot is the one that reads n in the first thread
+		// and n + 1 in the second.
+		tls_snapshot_t b;
+		take_tls_snapshot(isolate, b);
+		for (pthread_key_t ii = 0; ii < key_count && ii < b.values.size(); ++ii) {
+			intptr_t va = reinterpret_cast<intptr_t>(a.values[ii]);
+			intptr_t vb = reinterpret_cast<intptr_t>(b.values[ii]);
+			if (va > 0 && va < (1 << 24) && vb == va + 1) {
+				thread_id_key = ii;
+				break;
+			}
 		}
 	}
 	assert(thread_id_key != 0x7777);
-
-	isolate->Exit();
-	return NULL;
+	if (getenv("FIBERS_DEBUG_TLS")) {
+		fprintf(stderr, "fibers: v8 tls keys isolate=%d thread_data=%d thread_id=%d (0x7777 = not found)\n",
+			(int)isolate_key, (int)thread_data_key, (int)thread_id_key);
+	}
 }
 
 /**
@@ -149,9 +213,13 @@ void Coroutine::init(v8::Isolate* isolate) {
 	thread_data_key = v8::internal::Isolate::per_isolate_thread_data_key_;
 	thread_id_key = v8::internal::Isolate::thread_id_key_;
 #elif !defined(CORO_PTHREAD)
-	pthread_t thread;
-	pthread_create(&thread, NULL, find_thread_id_key, isolate);
-	pthread_join(thread, NULL);
+	find_thread_id_key(isolate);
+#endif
+#if !defined(WINDOWS) && !defined(CORO_PTHREAD)
+	set_thread_stack_start = reinterpret_cast<set_thread_stack_start_t>(dlsym(RTLD_DEFAULT, "v8_qualia_set_thread_stack_start"));
+	if (getenv("FIBERS_DEBUG_TLS")) {
+		fprintf(stderr, "fibers: v8_qualia_set_thread_stack_start %s\n", set_thread_stack_start ? "found" : "not found (GC may scan the wrong stack)");
+	}
 #endif
 }
 
@@ -253,18 +321,34 @@ void Coroutine::reset(entry_t* entry, void* arg) {
 	this->arg = arg;
 }
 
+static void notify_stack_start(const Coroutine& next) {
+	if (!set_thread_stack_start) {
+		return;
+	}
+	void* bottom = next.bottom();
+	// The original thread's Coroutine has no stack of its own: fall back to the OS thread's stack.
+	set_thread_stack_start(bottom ? static_cast<char*>(bottom) + next.stack_bytes() : NULL);
+}
+
 void Coroutine::transfer(Coroutine& next) {
 	assert(this != &next);
 #ifndef CORO_PTHREAD
-	fls_data[0] = pthread_getspecific(isolate_key);
-	fls_data[1] = pthread_getspecific(thread_id_key);
-	fls_data[2] = pthread_getspecific(thread_data_key);
-
-	pthread_setspecific(isolate_key, next.fls_data[0]);
-	pthread_setspecific(thread_id_key, next.fls_data[1]);
-	pthread_setspecific(thread_data_key, next.fls_data[2]);
+	// Keys V8 no longer keeps in pthread TLS stay at 0x7777 and are skipped.
+	if (isolate_key != 0x7777) {
+		fls_data[0] = pthread_getspecific(isolate_key);
+		pthread_setspecific(isolate_key, next.fls_data[0]);
+	}
+	if (thread_id_key != 0x7777) {
+		fls_data[1] = pthread_getspecific(thread_id_key);
+		pthread_setspecific(thread_id_key, next.fls_data[1]);
+	}
+	if (thread_data_key != 0x7777) {
+		fls_data[2] = pthread_getspecific(thread_data_key);
+		pthread_setspecific(thread_data_key, next.fls_data[2]);
+	}
 
 	pthread_setspecific(coro_thread_key, &next);
+	notify_stack_start(next);
 #endif
 	coro_transfer(&context, &next.context);
 #ifndef CORO_PTHREAD
@@ -319,6 +403,14 @@ void* Coroutine::bottom() const {
 	return stack_base;
 #else
 	return stack.sptr;
+#endif
+}
+
+size_t Coroutine::stack_bytes() const {
+#ifdef CORO_FIBER
+	return stack_size * sizeof(void*);
+#else
+	return stack.ssze;
 #endif
 }
 

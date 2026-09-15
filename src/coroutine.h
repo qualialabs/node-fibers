@@ -89,6 +89,11 @@ class Coroutine {
 		void* bottom() const;
 
 		/**
+		 * Size in bytes of this coroutine's stack (0 for the original thread).
+		 */
+		size_t stack_bytes() const;
+
+		/**
 		 * Returns the size this Coroutine takes up in the heap.
 		 */
 		size_t size() const;
