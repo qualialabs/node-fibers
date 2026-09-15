@@ -11,7 +11,8 @@ function Fiber(fn, ...args) {
   const ar = new AsyncResource('Fiber');
   const actualFn = (...args1) => ar.runInAsyncScope(() => {
     Fiber.current._meteor_dynamics = undefined;
-    fn(...args1);
+    // return the fiber function's value so run() resolves to it when the fiber finishes (fibers README semantics)
+    return fn(...args1);
   });
   const _fiber = _Fiber(actualFn, ...args);
   asyncResourceWeakMap.set(_fiber, ar);
