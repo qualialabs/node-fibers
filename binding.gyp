@@ -41,7 +41,15 @@
 				['OS == "linux"',
 					{
 						'cflags_c': [ '-std=gnu11' ],
-						'defines': ['CORO_PTHREAD'],
+						'variables': {
+							'USE_MUSL': '<!(ldd --version 2>&1 | head -n1 | grep "musl" | wc -l)',
+						},
+						'conditions': [
+							['<(USE_MUSL) == 1',
+								{'defines': ['CORO_ASM', '__MUSL__']},
+								{'defines': ['CORO_UCONTEXT']}
+							],
+						],
 					},
 				],
 				['OS == "solaris" or OS == "sunos" or OS == "freebsd" or OS == "aix"', {'defines': ['CORO_UCONTEXT']}],
@@ -49,16 +57,19 @@
 				['OS == "openbsd"', {'defines': ['CORO_ASM']}],
 				['target_arch == "arm"',
 					{
-						# There's been problems getting real fibers working on arm
-						'defines': ['CORO_PTHREAD'],
-						'defines!': ['CORO_UCONTEXT', 'CORO_SJLJ', 'CORO_ASM'],
+						# ucontext works on 32-bit arm with glibc; the old CORO_PTHREAD fallback made every
+						# fiber an OS thread and every switch a condvar handoff.
+						'defines': ['CORO_UCONTEXT', '_XOPEN_SOURCE'],
+						'defines!': ['CORO_PTHREAD', 'CORO_SJLJ', 'CORO_ASM'],
 					},
 				],
 				['target_arch == "arm64"',
 					{
-						# There's been problems getting real fibers working on arm
-						'defines': ['CORO_PTHREAD'],
-						'defines!': ['CORO_UCONTEXT', 'CORO_SJLJ', 'CORO_ASM'],
+						# No prebuilt binaries ship for arm64, so production (Graviton) and arm64 CI/dev
+						# compile from source. CORO_PTHREAD here cost ~13 us per switch versus ~0.7 us with
+						# swapcontext, which glibc supports on aarch64.
+						'defines': ['CORO_UCONTEXT', '_XOPEN_SOURCE'],
+						'defines!': ['CORO_PTHREAD', 'CORO_SJLJ', 'CORO_ASM'],
 					},
 				],
 			],
