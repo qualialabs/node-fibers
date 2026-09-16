@@ -180,21 +180,37 @@ static void find_thread_id_key(v8::Isolate* isolate) {
 	}
 
 	if (thread_id_key == 0x7777) {
-		// Fallback for V8 >= 13: compare against a second helper thread. V8 hands out thread ids
-		// from an atomic counter, so the ThreadId slot is the one that reads n in the first thread
-		// and n + 1 in the second.
-		tls_snapshot_t b;
-		take_tls_snapshot(isolate, b);
-		for (pthread_key_t ii = 0; ii < key_count && ii < b.values.size(); ++ii) {
-			intptr_t va = reinterpret_cast<intptr_t>(a.values[ii]);
-			intptr_t vb = reinterpret_cast<intptr_t>(b.values[ii]);
-			if (va > 0 && va < (1 << 24) && vb == va + 1) {
-				thread_id_key = ii;
-				break;
+		// Fallback for V8 >= 13: compare against further helper threads. V8 hands out thread ids
+		// from an atomic counter, so the ThreadId slot is the one whose small positive value grows
+		// between two consecutively created threads. Other threads (V8 platform workers) may be
+		// created concurrently and consume ids, so allow a small gap, require the match to be
+		// unique, and retry with a fresh snapshot pair when it is not.
+		for (int attempt = 0; attempt < 8 && thread_id_key == 0x7777; ++attempt) {
+			tls_snapshot_t b;
+			take_tls_snapshot(isolate, b);
+			pthread_key_t candidate = 0x7777;
+			int candidates = 0;
+			for (pthread_key_t ii = 0; ii < key_count && ii < b.values.size(); ++ii) {
+				intptr_t va = reinterpret_cast<intptr_t>(a.values[ii]);
+				intptr_t vb = reinterpret_cast<intptr_t>(b.values[ii]);
+				if (va > 0 && va < (1 << 24) && vb > va && vb - va <= 64) {
+					candidate = ii;
+					++candidates;
+				}
 			}
+			if (candidates == 1) {
+				thread_id_key = candidate;
+			}
+			a = b;
 		}
 	}
-	assert(thread_id_key != 0x7777);
+	if (thread_id_key == 0x7777) {
+		// Without this key every coroutine shares the OS thread's V8 ThreadId and Locker/Unlocker
+		// archiving silently corrupts JS stacks. Refuse to run rather than fail intermittently
+		// later (an assert would be compiled out of Release builds).
+		fprintf(stderr, "fibers: could not locate V8's ThreadId thread-local key; this node/V8 build is not supported (set FIBERS_DEBUG_TLS=1 for details)\n");
+		abort();
+	}
 	if (getenv("FIBERS_DEBUG_TLS")) {
 		fprintf(stderr, "fibers: v8 tls keys isolate=%d thread_data=%d thread_id=%d (0x7777 = not found)\n",
 			(int)isolate_key, (int)thread_data_key, (int)thread_id_key);
