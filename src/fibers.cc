@@ -480,6 +480,7 @@ class Fiber {
 		 * i.e. After fiber completes, while yielded, or before started
 		 */
 		void MakeWeak() {
+			if (handle.IsEmpty()) return; // garbage-collected fiber being unwound as a zombie
 			uni::MakeWeak<WeakCallback>(isolate, handle, (void*)this);
 		}
 
@@ -488,6 +489,7 @@ class Fiber {
 		 * i.e. While running.
 		 */
 		void ClearWeak() {
+			if (handle.IsEmpty()) return; // see MakeWeak()
 			handle.ClearWeak();
 		}
 
@@ -508,7 +510,14 @@ class Fiber {
 			if (that.started) {
 				assert(that.yielding);
 				orphaned_fibers.push_back(&that);
+#if V8_AT_LEAST(10, 4)
+				// kParameter is a phantom callback: V8 has already reclaimed the JS object and CHECKs that
+				// the handle was reset before this callback returns ("Handle not reset in first callback").
+				// The fiber is unwound and deleted by DestroyOrphans; there is no JS object to hand back.
+				uni::Dispose(that.isolate, that.handle);
+#else
 				that.ClearWeak();
+#endif
 				return;
 			}
 
@@ -550,7 +559,12 @@ class Fiber {
 				}
 
 				uni::Dispose(that.isolate, that.yielded);
+#if V8_AT_LEAST(10, 4)
+				// The JS object is gone (see WeakCallback); nothing can reference this fiber again.
+				delete &that;
+#else
 				that.MakeWeak();
+#endif
 			}
 		}
 
@@ -851,7 +865,8 @@ class Fiber {
 		}
 
 		static uni::FunctionType GetCurrent(Local<String> property, const uni::GetterCallbackInfo& info) {
-			if (current) {
+			if (current && !current->handle.IsEmpty()) {
+				// The handle is empty while a garbage-collected fiber is being unwound as a zombie.
 				return uni::Return(current->handle, info);
 			} else {
 				return uni::Return(uni::Undefined(Isolate::GetCurrent()), info);
