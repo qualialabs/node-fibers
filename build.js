@@ -95,7 +95,8 @@ function afterBuild() {
 	var installPath = path.join(__dirname, 'bin', modPath, 'fibers.node');
 
 	try {
-		fs.mkdirSync(path.join(__dirname, 'bin', modPath));
+		// recursive: a source-only package (no prebuilt binaries) has no bin/ directory at all
+		fs.mkdirSync(path.join(__dirname, 'bin', modPath), { recursive: true });
 	} catch (ex) {}
 
 	try {
