@@ -28,6 +28,19 @@ Object.defineProperty(Fiber, 'current', {
   }
 })
 
+// poolSize is a native data property on the native constructor. On V8 >= 13 (node 24) assigning
+// `Fiber.poolSize = n` on this wrapper no longer reaches that setter: it creates an own property on
+// the wrapper and the native pool size silently stays at its default (120). Forward it explicitly,
+// which is also what happened implicitly on node 18.
+Object.defineProperty(Fiber, 'poolSize', {
+  get() {
+    return _Fiber.poolSize;
+  },
+  set(value) {
+    _Fiber.poolSize = value;
+  },
+})
+
 
 _Fiber.prototype.runInAsyncScope = function runInAsyncScope(fn) {
   return asyncResourceWeakMap.get(this).runInAsyncScope(fn);
