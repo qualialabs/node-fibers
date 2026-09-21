@@ -202,11 +202,13 @@ namespace uni {
 		args.GetReturnValue().Set(handle);
 	}
 	template <class T>
-	void Return(Local<T> handle, GetterCallbackInfo info) {
+	// PropertyCallbackInfo must be taken by reference: since V8 13 it holds the argument slots inline,
+	// so GetReturnValue().Set() on a by-value copy is silently lost.
+	void Return(Local<T> handle, const GetterCallbackInfo& info) {
 		info.GetReturnValue().Set(handle);
 	}
 	template <class T>
-	void Return(Persistent<T>& handle, GetterCallbackInfo info) {
+	void Return(Persistent<T>& handle, const GetterCallbackInfo& info) {
 		info.GetReturnValue().Set(Local<T>::New(Isolate::GetCurrent(), handle));
 	}
 
@@ -357,7 +359,23 @@ namespace uni {
 	}
 #endif
 
-#if V8_AT_LEAST(6, 1)
+#if V8_AT_LEAST(13, 0)
+	// FunctionCallbackInfo::Holder() was removed in V8 13; This() is the documented replacement.
+	inline Local<Object> Holder(const FunctionCallbackInfo<Value>& args) { return args.This(); }
+#else
+	inline Local<Object> Holder(const FunctionCallbackInfo<Value>& args) { return args.Holder(); }
+#endif
+
+#if V8_AT_LEAST(13, 0)
+	// ObjectTemplate::SetAccessor / Object::SetAccessor were removed in V8 13; SetNativeDataProperty is the replacement.
+	void SetAccessor(
+		Isolate* isolate, Local<Object> object, Local<String> name,
+		FunctionType (*getter)(Local<String>, const GetterCallbackInfo&),
+		void (*setter)(Local<String> property, Local<Value> value, const SetterCallbackInfo&) = 0
+	) {
+		object->SetNativeDataProperty(isolate->GetCurrentContext(), name, (AccessorNameGetterCallback)getter, (AccessorNameSetterCallback)setter).ToChecked();
+	}
+#elif V8_AT_LEAST(6, 1)
 	void SetAccessor(
 		Isolate* isolate, Local<Object> object, Local<String> name,
 		FunctionType (*getter)(Local<String>, const GetterCallbackInfo&),
@@ -462,6 +480,7 @@ class Fiber {
 		 * i.e. After fiber completes, while yielded, or before started
 		 */
 		void MakeWeak() {
+			if (handle.IsEmpty()) return; // garbage-collected fiber being unwound as a zombie
 			uni::MakeWeak<WeakCallback>(isolate, handle, (void*)this);
 		}
 
@@ -470,6 +489,7 @@ class Fiber {
 		 * i.e. While running.
 		 */
 		void ClearWeak() {
+			if (handle.IsEmpty()) return; // see MakeWeak()
 			handle.ClearWeak();
 		}
 
@@ -490,7 +510,14 @@ class Fiber {
 			if (that.started) {
 				assert(that.yielding);
 				orphaned_fibers.push_back(&that);
+#if V8_AT_LEAST(10, 4)
+				// kParameter is a phantom callback: V8 has already reclaimed the JS object and CHECKs that
+				// the handle was reset before this callback returns ("Handle not reset in first callback").
+				// The fiber is unwound and deleted by DestroyOrphans; there is no JS object to hand back.
+				uni::Dispose(that.isolate, that.handle);
+#else
 				that.ClearWeak();
+#endif
 				return;
 			}
 
@@ -532,7 +559,12 @@ class Fiber {
 				}
 
 				uni::Dispose(that.isolate, that.yielded);
+#if V8_AT_LEAST(10, 4)
+				// The JS object is gone (see WeakCallback); nothing can reference this fiber again.
+				delete &that;
+#else
 				that.MakeWeak();
+#endif
 			}
 		}
 
@@ -560,7 +592,7 @@ class Fiber {
 		 * be created and the callback will start. Otherwise we switch back into the exist context.
 		 */
 		static uni::FunctionType Run(const uni::Arguments& args) {
-			Fiber& that = Unwrap(args.Holder());
+			Fiber& that = Unwrap(uni::Holder(args));
 
 			// There seems to be no better place to put this check..
 			DestroyOrphans();
@@ -601,7 +633,7 @@ class Fiber {
 		 * Throw an exception into a currently yielding fiber.
 		 */
 		static uni::FunctionType ThrowInto(const uni::Arguments& args) {
-			Fiber& that = Unwrap(args.Holder());
+			Fiber& that = Unwrap(uni::Holder(args));
 
 			if (!that.yielding) {
 				THROW(Exception::Error, "This Fiber is not yielding");
@@ -622,7 +654,7 @@ class Fiber {
 		 * effect.
 		 */
 		static uni::FunctionType Reset(const uni::Arguments& args) {
-			Fiber& that = Unwrap(args.Holder());
+			Fiber& that = Unwrap(uni::Holder(args));
 
 			if (!that.started) {
 				return uni::Return(uni::Undefined(that.isolate), args);
@@ -833,7 +865,8 @@ class Fiber {
 		}
 
 		static uni::FunctionType GetCurrent(Local<String> property, const uni::GetterCallbackInfo& info) {
-			if (current) {
+			if (current && !current->handle.IsEmpty()) {
+				// The handle is empty while a garbage-collected fiber is being unwound as a zombie.
 				return uni::Return(current->handle, info);
 			} else {
 				return uni::Return(uni::Undefined(Isolate::GetCurrent()), info);
@@ -891,7 +924,11 @@ class Fiber {
 				uni::NewFunctionTemplate(isolate, Run, Local<Value>(), sig));
 			proto->Set(uni::NewLatin1Symbol(isolate, "throwInto"),
 				uni::NewFunctionTemplate(isolate, ThrowInto, Local<Value>(), sig));
+#if V8_AT_LEAST(13, 0)
+			proto->SetNativeDataProperty(uni::NewLatin1Symbol(isolate, "started"), (AccessorNameGetterCallback)GetStarted);
+#else
 			proto->SetAccessor(uni::NewLatin1Symbol(isolate, "started"), GetStarted);
+#endif
 
 			// Global yield() function
 			Local<Function> yield = uni::GetFunction(uni::NewFunctionTemplate(isolate, Yield_));
