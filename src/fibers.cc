@@ -6,11 +6,53 @@
 
 #include <vector>
 #include <iostream>
+#include <type_traits>
+#include <dlfcn.h>
 
 #define THROW(x, m) return uni::Return(uni::ThrowException(Isolate::GetCurrent(), x(uni::NewLatin1String(Isolate::GetCurrent(), m))), args)
 
 using namespace std;
 using namespace v8;
+
+// Qualia: a patched V8 exposes the microtask queue's "checkpoint in progress"
+// state (v8::MicrotaskQueue::RunState). Fibers save and restore it on every
+// switch so that suspending a fiber in the middle of a checkpoint doesn't
+// leave the queue looking busy to everyone else. On a stock V8 this is a no-op.
+template <typename Q, typename = void>
+struct MicrotaskRunState {
+	struct State {};
+	static bool Supported() { return false; }
+	static State Get(Q*) { return State(); }
+	static void Set(Q*, const State&) {}
+	static State Park(Q*) { return State(); }
+	static bool Idle(Q*) { return true; }
+	static size_t Size(Q*) { return 0; }
+};
+
+template <typename Q>
+struct MicrotaskRunState<Q, std::void_t<typename Q::RunState>> {
+	typedef typename Q::RunState State;
+	static bool Supported() { return true; }
+	static State Get(Q* q) { return q->GetRunState(); }
+	static void Set(Q* q, const State& state) { q->SetRunState(state); }
+	// State to save for a fiber that is switching out. If it is suspended mid-drain, another stack
+	// takes over the queue, so when it resumes its drain loop must stop after the current microtask.
+	static State Park(Q* q) {
+		State state = q->GetRunState();
+		if (state.is_running) {
+			state.stop_draining = true;
+		}
+		return state;
+	}
+	static bool Idle(Q* q) {
+		State state = q->GetRunState();
+		return !state.is_running && !state.scope_depth && !state.suppressions;
+	}
+	static size_t Size(Q* q) { return q->Size(); }
+};
+
+typedef MicrotaskRunState<MicrotaskQueue> QueueRunState;
+typedef void (*MicrotaskCheckpointHook)(Isolate*, Local<Context>, MicrotaskQueue*);
 
 // Handle legacy V8 API
 namespace uni {
@@ -404,6 +446,8 @@ class Fiber {
 		static Fiber* current;
 		static vector<Fiber*> orphaned_fibers;
 		static Persistent<Value> fatal_stack;
+		static MicrotaskQueue* microtask_queue;
+		static Persistent<Function> microtask_drain;
 
 		Isolate* isolate;
 		Persistent<Object> handle;
@@ -418,6 +462,7 @@ class Fiber {
 		bool yielding;
 		bool zombie;
 		bool resetting;
+		QueueRunState::State microtask_state;
 
 		static Fiber& Unwrap(Local<Object> handle) {
 			assert(!handle.IsEmpty());
@@ -678,6 +723,13 @@ class Fiber {
 			Fiber* last_fiber = current;
 			current = this;
 
+			// The microtask queue's run state belongs to whichever stack is draining it.
+			QueueRunState::State outer_microtask_state;
+			if (microtask_queue) {
+				outer_microtask_state = QueueRunState::Get(microtask_queue);
+				QueueRunState::Set(microtask_queue, microtask_state);
+			}
+
 			// This will jump into either `RunFiber()` or `Yield()`, depending on if the fiber was
 			// already running.
 			{
@@ -687,6 +739,10 @@ class Fiber {
 			}
 
 			// At this point the fiber either returned or called `yield()`.
+			if (microtask_queue) {
+				microtask_state = QueueRunState::Park(microtask_queue);
+				QueueRunState::Set(microtask_queue, outer_microtask_state);
+			}
 			current = last_fiber;
 		}
 
@@ -830,6 +886,76 @@ class Fiber {
 		}
 
 		/**
+		 * Called by a patched node in place of draining the microtask queue. Hands the drain to
+		 * the JS function registered with `__setMicrotaskDrain()`, which runs it on a fiber so
+		 * that `await` continuations can `Fiber.yield()`.
+		 */
+		static void MicrotaskCheckpoint(Isolate* isolate, Local<Context> context, MicrotaskQueue* queue) {
+			if (queue != microtask_queue || microtask_drain.IsEmpty() || !QueueRunState::Size(queue)) {
+				queue->PerformCheckpoint(isolate);
+				return;
+			}
+			if (!QueueRunState::Idle(queue)) {
+				// Already draining (or suppressed); PerformCheckpoint would be a no-op too.
+				return;
+			}
+			uni::HandleScope scope(isolate);
+			Context::Scope context_scope(context);
+			uni::TryCatch try_catch(isolate);
+			Local<Function> drain = uni::Deref(isolate, microtask_drain);
+			(void)drain->Call(context, context->Global(), 0, NULL);
+			if (try_catch.HasTerminated()) {
+				return;
+			}
+			if (try_catch.HasCaught()) {
+				// The drain machinery itself failed (microtasks never throw out of a checkpoint).
+				String::Utf8Value message(isolate, try_catch.Exception());
+				fprintf(stderr, "[fibers] microtask drain failed, draining on the current stack: %s\n", *message ? *message : "<unknown>");
+			}
+			// Anything left (e.g. after a failure) drains the old way.
+			queue->PerformCheckpoint(isolate);
+		}
+
+		/**
+		 * Fiber.__setMicrotaskDrain(fn): register `fn` as the microtask drain. Returns false if this
+		 * node doesn't support it.
+		 */
+		static uni::FunctionType SetMicrotaskDrain(const uni::Arguments& args) {
+			Isolate* isolate = Isolate::GetCurrent();
+			if (args.Length() != 1 || !args[0]->IsFunction()) {
+				THROW(Exception::TypeError, "__setMicrotaskDrain() expects a function");
+			}
+			typedef void (*SetHook)(MicrotaskCheckpointHook);
+			SetHook set_hook = (SetHook)dlsym(RTLD_DEFAULT, "node_qualia_set_microtask_checkpoint_hook");
+			if (!QueueRunState::Supported() || !set_hook) {
+				return uni::Return(uni::NewBoolean(isolate, false), args);
+			}
+			uni::Reset(isolate, microtask_drain, Local<Function>::Cast(args[0]));
+			set_hook(MicrotaskCheckpoint);
+			return uni::Return(uni::NewBoolean(isolate, true), args);
+		}
+
+		/**
+		 * Fiber.__runMicrotasks(): drain the microtask queue on the current stack.
+		 */
+		static uni::FunctionType RunMicrotasks(const uni::Arguments& args) {
+			Isolate* isolate = Isolate::GetCurrent();
+			if (microtask_queue) {
+				microtask_queue->PerformCheckpoint(isolate);
+			}
+			return uni::Return(uni::Undefined(isolate), args);
+		}
+
+		/**
+		 * Fiber.__microtaskQueueSize()
+		 */
+		static uni::FunctionType MicrotaskQueueSize(const uni::Arguments& args) {
+			Isolate* isolate = Isolate::GetCurrent();
+			size_t size = microtask_queue ? QueueRunState::Size(microtask_queue) : 0;
+			return uni::Return(uni::NewNumber(isolate, (double)size), args);
+		}
+
+		/**
 		 * Allow access to coroutine pool size
 		 */
 		static uni::FunctionType GetPoolSize(Local<String> property, const uni::GetterCallbackInfo& info) {
@@ -861,6 +987,9 @@ class Fiber {
 			Local<Context> context = isolate->GetCurrentContext();
 			global_locker = new Locker(isolate);
 			current = NULL;
+			if (QueueRunState::Supported()) {
+				microtask_queue = context->GetMicrotaskQueue();
+			}
 
 			// Fiber constructor
 			Local<FunctionTemplate> tmpl = uni::NewFunctionTemplate(isolate, New);
@@ -893,6 +1022,12 @@ class Fiber {
 			uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "current"), GetCurrent);
 			uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "poolSize"), GetPoolSize, SetPoolSize);
 			uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "fibersCreated"), GetFibersCreated);
+			fn->Set(context, uni::NewLatin1Symbol(isolate, "__setMicrotaskDrain"),
+				uni::GetFunction(uni::NewFunctionTemplate(isolate, SetMicrotaskDrain))).FromJust();
+			fn->Set(context, uni::NewLatin1Symbol(isolate, "__runMicrotasks"),
+				uni::GetFunction(uni::NewFunctionTemplate(isolate, RunMicrotasks))).FromJust();
+			fn->Set(context, uni::NewLatin1Symbol(isolate, "__microtaskQueueSize"),
+				uni::GetFunction(uni::NewFunctionTemplate(isolate, MicrotaskQueueSize))).FromJust();
 
 			// Global Fiber
 			target->Set(context, uni::NewLatin1Symbol(isolate, "Fiber"), fn).FromJust();
@@ -906,6 +1041,8 @@ Locker* Fiber::global_locker;
 Fiber* Fiber::current = NULL;
 vector<Fiber*> Fiber::orphaned_fibers;
 Persistent<Value> Fiber::fatal_stack;
+MicrotaskQueue* Fiber::microtask_queue = NULL;
+Persistent<Function> Fiber::microtask_drain;
 bool did_init = false;
 
 #if !NODE_VERSION_AT_LEAST(0,10,0)
