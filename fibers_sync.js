@@ -24,6 +24,48 @@ if (process.fiberLib) {
 	}
 
 	setupAsyncHacks(module.exports);
+	setupMicrotaskFibers(module.exports);
+}
+
+// Drain the microtask queue on a fiber, so that code resuming from an `await` (which would
+// otherwise run on whatever stack drained the queue, usually the main one) can Fiber.yield().
+// When a microtask yields, the fiber it was drained on becomes that microtask's fiber, and a
+// fresh fiber carries on draining. Requires the Qualia node patch; a no-op otherwise.
+function setupMicrotaskFibers(Fiber) {
+	if (process.env.FIBERS_DISABLE_MICROTASK_FIBERS || !(Fiber.__setMicrotaskDrain instanceof Function)) {
+		return;
+	}
+	var DRAINED = {};
+	var drainFiber = null;
+	var runMicrotasks = Fiber.__runMicrotasks;
+	var queueSize = Fiber.__microtaskQueueSize;
+
+	function drainLoop() {
+		var self = Fiber.current;
+		for (;;) {
+			runMicrotasks();
+			if (self !== drainFiber) {
+				// A microtask parked this fiber and has since been resumed and finished; let it unwind.
+				return;
+			}
+			Fiber.yield(DRAINED);
+		}
+	}
+
+	function drain() {
+		do {
+			if (!drainFiber) {
+				drainFiber = Fiber(drainLoop);
+			}
+			if (drainFiber.run() === DRAINED) {
+				return;
+			}
+			// A microtask yielded the drain fiber; it now belongs to that microtask.
+			drainFiber = null;
+		} while (queueSize() > 0);
+	}
+
+	Fiber.microtaskFibers = Fiber.__setMicrotaskDrain(drain);
 }
 
 function setupAsyncHacks(Fiber) {
