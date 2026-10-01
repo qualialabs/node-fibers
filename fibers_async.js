@@ -10,7 +10,7 @@ const asyncResourceWeakMap = new WeakMap();
 function Fiber(fn, ...args) {
   const ar = new AsyncResource('Fiber');
   const actualFn = (...args1) => ar.runInAsyncScope(() => {
-    Fiber.current._meteor_dynamics = undefined;
+    _Fiber.current._meteor_dynamics = undefined;
     fn(...args1);
   });
   const _fiber = _Fiber(actualFn, ...args);
@@ -21,7 +21,20 @@ function Fiber(fn, ...args) {
 Fiber.__proto__ = _Fiber;
 Fiber.prototype = _Fiber.prototype;
 
+// Fibers that run promise reactions (see below) are hidden: `Fiber.current` reports them as
+// undefined, exactly what code after an `await` sees today, so `Fiber.current`-based mode switches
+// ("in a fiber? return sync, else return a Promise") keep behaving as before. Blocking primitives
+// (Future.wait, Promise.await) use `Fiber.currentIncludingHidden` so they can still yield.
+const kHidden = Symbol.for('fibers.hiddenAwaitContinuation');
+
 Object.defineProperty(Fiber, 'current', {
+  get() {
+    const current = _Fiber.current;
+    return current && current[kHidden] ? undefined : current;
+  }
+})
+
+Object.defineProperty(Fiber, 'currentIncludingHidden', {
   get() {
     return _Fiber.current;
   }
@@ -36,5 +49,17 @@ _Fiber[Symbol.hasInstance] = function(obj) {
   // hacky
   return obj instanceof Fiber || obj.run;
 };
+
+// Prototype (Qualia): with a patched node, V8 offers us every promise reaction (e.g. the code after
+// an `await`) that was registered inside a fiber. Run it in a new, hidden fiber so it can still
+// block. The job's own promise hooks restore its async context inside the fiber.
+// FIBERS_AWAIT_DISPATCH=0 turns this off.
+if (typeof _Fiber.__setMicrotaskDispatcher === 'function' && process.env.FIBERS_AWAIT_DISPATCH !== '0') {
+  _Fiber.__setMicrotaskDispatcher(function dispatchMicrotask(runDispatched, token) {
+    const fiber = Fiber(() => runDispatched(token));
+    fiber[kHidden] = true;
+    fiber.run();
+  });
+}
 
 module.exports = _Fiber.Fiber = Fiber;
