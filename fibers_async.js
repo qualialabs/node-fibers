@@ -72,7 +72,8 @@ function dispatchOnNewFiber(runDispatched, token) {
 // one switch onto the fiber and one back, not two per `await`. A job that blocks keeps the fiber
 // (it's parked inside that job), and the next dispatch starts a new one. FIBERS_AWAIT_REUSE=0 turns
 // this off.
-let microtasksBatched = 0;
+// Kept on the native module, which every copy of this file shares (an app can load more than one).
+_Fiber.__microtasksBatched = _Fiber.__microtasksBatched || 0;
 function reusingDispatcher(runNextDispatchable) {
   const kIdle = {};
   let dispatchFiber = null;
@@ -85,7 +86,7 @@ function reusingDispatcher(runNextDispatchable) {
       // Only while this is still the dispatch fiber, i.e. we're nested inside the microtask loop.
       // A fiber that was parked by a job and later resumed must not pull in unrelated jobs.
       while (self === dispatchFiber && runNextDispatchable()) {
-        microtasksBatched++;
+        _Fiber.__microtasksBatched++;
       }
       if (self !== dispatchFiber) {
         return;
@@ -115,7 +116,7 @@ function reusingDispatcher(runNextDispatchable) {
 
 Object.defineProperty(Fiber, 'microtasksBatched', {
   get() {
-    return microtasksBatched;
+    return _Fiber.__microtasksBatched || 0;
   }
 })
 
