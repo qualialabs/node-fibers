@@ -6,6 +6,10 @@ This branch adds, on top of #8:
 - `Fiber.microtaskDrains`, `Fiber.drainsWithDispatch`, `Fiber.redispatches` (C++ counters; `Fiber.microtasksDispatched` and `Fiber.microtasksBatched` already exist)
 - `fiber-await/test.js`, `fiber-await/bench.js`, `fiber-await/app_stats.mjs`
 
+## Node 24
+
+On node 24 run everything with `--no-async-context-frame`, e.g. `node --no-deprecation --no-async-context-frame fiber-await/test.js`. With AsyncContextFrame on (node 24's default), AsyncLocalStorage keeps its state in the same V8 slot the dispatcher tags with, so fibers doesn't install the dispatcher (`Fiber.awaitDispatchEnabled` is `false`; set `FIBERS_AWAIT_DISPATCH=1` to get a warning instead). Fibers on node 24 needs the flag anyway.
+
 ## What gets measured
 
 A promise callback (the code after an `await`, a `.then` callback) is **tagged** if it was registered while a fiber was running. Tagged callbacks are run on a hidden *dispatch fiber*; untagged ones run on the main stack as on stock node.
