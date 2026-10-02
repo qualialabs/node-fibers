@@ -69,8 +69,10 @@ _Fiber[Symbol.hasInstance] = function(obj) {
 // an `await`) that was registered inside a fiber. Run it in a hidden fiber so it can still block.
 // The job's own promise hooks restore its async context inside the fiber.
 // FIBERS_AWAIT_DISPATCH=0 turns this off.
+_Fiber.awaitDispatchEnabled = false;
 if (typeof _Fiber.__setMicrotaskDispatcher === 'function' && process.env.FIBERS_AWAIT_DISPATCH !== '0'
     && !asyncContextFrameInUse()) {
+  _Fiber.awaitDispatchEnabled = true;
   const runNextDispatchable = process.env.FIBERS_AWAIT_REUSE !== '0' ? _Fiber.__runNextDispatchable : undefined;
   _Fiber.__setMicrotaskDispatcher(typeof runNextDispatchable === 'function'
     ? reusingDispatcher(runNextDispatchable)
@@ -79,13 +81,15 @@ if (typeof _Fiber.__setMicrotaskDispatcher === 'function' && process.env.FIBERS_
 
 // Node 24's AsyncContextFrame (on by default) keeps AsyncLocalStorage state in the V8 slot we tag
 // reactions with, so dispatch needs `--no-async-context-frame` (fibers needs it on node 24 anyway).
+// Quiet unless FIBERS_AWAIT_DISPATCH=1 asks for dispatch: helper processes (build tools, child
+// processes) load fibers without the flag. Fiber.awaitDispatchEnabled tells you which way it went.
 function asyncContextFrameInUse() {
   if (typeof _Fiber.__cpedInUse !== 'function') {
     return false;
   }
   const { AsyncLocalStorage } = require('async_hooks');
   const inUse = new AsyncLocalStorage().run(true, () => _Fiber.__cpedInUse());
-  if (inUse) {
+  if (inUse && process.env.FIBERS_AWAIT_DISPATCH === '1') {
     console.warn('[fibers] not running await continuations on fibers: AsyncContextFrame is on (start node with --no-async-context-frame)');
   }
   return inUse;
