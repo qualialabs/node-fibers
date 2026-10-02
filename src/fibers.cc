@@ -21,8 +21,10 @@
 // Looked up at load time so this binary still works (with the feature off) on unpatched node.
 typedef void (*SetMicrotaskDispatchCallbackFn)(v8::Isolate*, v8::MicrotaskDispatchCallback, void*);
 typedef void (*RunDispatchedMicrotaskFn)(v8::Isolate*, v8::DispatchedMicrotask*);
+typedef bool (*RunNextDispatchableMicrotaskFn)(v8::Isolate*);
 static SetMicrotaskDispatchCallbackFn set_microtask_dispatch_callback = NULL;
 static RunDispatchedMicrotaskFn run_dispatched_microtask = NULL;
+static RunNextDispatchableMicrotaskFn run_next_dispatchable_microtask = NULL;
 #endif
 
 #define THROW(x, m) return uni::Return(uni::ThrowException(Isolate::GetCurrent(), x(uni::NewLatin1String(Isolate::GetCurrent(), m))), args)
@@ -971,6 +973,17 @@ class Fiber {
 			return uni::Return(uni::Undefined(isolate), args);
 		}
 
+		/**
+		 * Fiber.__runNextDispatchable(): if the next queued microtask is also one that would be
+		 * dispatched, run it on the current stack and return true. Lets the dispatch fiber run a
+		 * run of such jobs without switching stacks for each one.
+		 */
+		static uni::FunctionType RunNextDispatchable(const uni::Arguments& args) {
+			Isolate* isolate = args.GetIsolate();
+			bool ran = run_next_dispatchable_microtask(isolate);
+			return uni::Return(uni::NewBoolean(isolate, ran), args);
+		}
+
 		static uni::FunctionType GetMicrotasksDispatched(Local<String> property, const uni::GetterCallbackInfo& info) {
 			return uni::Return(uni::NewNumber(Isolate::GetCurrent(), microtasks_dispatched), info);
 		}
@@ -1034,6 +1047,11 @@ class Fiber {
 				fn->Set(context, uni::NewLatin1Symbol(isolate, "__setMicrotaskDispatcher"),
 					uni::GetFunction(uni::NewFunctionTemplate(isolate, SetMicrotaskDispatcher))).FromJust();
 				uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "microtasksDispatched"), GetMicrotasksDispatched);
+				run_next_dispatchable_microtask = (RunNextDispatchableMicrotaskFn)dlsym(RTLD_DEFAULT, "v8_qualia_RunNextDispatchableMicrotask");
+				if (run_next_dispatchable_microtask) {
+					fn->Set(context, uni::NewLatin1Symbol(isolate, "__runNextDispatchable"),
+						uni::GetFunction(uni::NewFunctionTemplate(isolate, RunNextDispatchable))).FromJust();
+				}
 			}
 #endif
 
