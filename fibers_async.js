@@ -88,7 +88,11 @@ function asyncContextFrameInUse() {
     return false;
   }
   const { AsyncLocalStorage } = require('async_hooks');
-  const inUse = new AsyncLocalStorage().run(true, () => _Fiber.__cpedInUse());
+  const probe = new AsyncLocalStorage();
+  const inUse = probe.run(true, () => _Fiber.__cpedInUse());
+  // Without AsyncContextFrame, an AsyncLocalStorage turns on promise hooks for the whole process
+  // (every promise pays for them); disabling the probe turns them off again if nothing else uses one.
+  probe.disable();
   if (inUse && process.env.FIBERS_AWAIT_DISPATCH === '1') {
     console.warn('[fibers] not running await continuations on fibers: AsyncContextFrame is on (start node with --no-async-context-frame)');
   }
