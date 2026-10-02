@@ -476,6 +476,12 @@ class Fiber {
 		static Persistent<Function> run_dispatched;
 		static Persistent<ObjectTemplate> token_template;
 		static double microtasks_dispatched;
+		// Diagnostics: how often a drain switches onto a dispatch fiber more than once (an untagged
+		// job between two tagged ones sends us back to the main stack).
+		static double microtask_drains;
+		static double drains_with_dispatch;
+		static double redispatches;
+		static double last_dispatch_drain;
 #endif
 
 		Isolate* isolate;
@@ -991,7 +997,30 @@ class Fiber {
 				return false;
 			}
 			++microtasks_dispatched;
+			if (last_dispatch_drain == microtask_drains) {
+				++redispatches;
+			} else {
+				++drains_with_dispatch;
+				last_dispatch_drain = microtask_drains;
+			}
 			return true;
+		}
+
+		// Runs after every checkpoint of the isolate's default microtask queue.
+		static void OnMicrotasksCompleted(Isolate* isolate, void* data) {
+			++microtask_drains;
+		}
+
+		static uni::FunctionType GetMicrotaskDrains(Local<String> property, const uni::GetterCallbackInfo& info) {
+			return uni::Return(uni::NewNumber(Isolate::GetCurrent(), microtask_drains), info);
+		}
+
+		static uni::FunctionType GetDrainsWithDispatch(Local<String> property, const uni::GetterCallbackInfo& info) {
+			return uni::Return(uni::NewNumber(Isolate::GetCurrent(), drains_with_dispatch), info);
+		}
+
+		static uni::FunctionType GetRedispatches(Local<String> property, const uni::GetterCallbackInfo& info) {
+			return uni::Return(uni::NewNumber(Isolate::GetCurrent(), redispatches), info);
 		}
 
 		/**
@@ -1033,6 +1062,7 @@ class Fiber {
 			}
 			microtask_dispatcher.Reset(isolate, args[0].As<Function>());
 			set_microtask_dispatch_callback(isolate, DispatchMicrotask, NULL);
+			isolate->AddMicrotasksCompletedCallback(OnMicrotasksCompleted, NULL);
 			return uni::Return(uni::Undefined(isolate), args);
 		}
 
@@ -1115,6 +1145,9 @@ class Fiber {
 				fn->Set(context, uni::NewLatin1Symbol(isolate, "__cpedInUse"),
 					uni::GetFunction(uni::NewFunctionTemplate(isolate, CpedInUse))).FromJust();
 				uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "microtasksDispatched"), GetMicrotasksDispatched);
+				uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "microtaskDrains"), GetMicrotaskDrains);
+				uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "drainsWithDispatch"), GetDrainsWithDispatch);
+				uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "redispatches"), GetRedispatches);
 				run_next_dispatchable_microtask = (RunNextDispatchableMicrotaskFn)dlsym(RTLD_DEFAULT, "v8_qualia_RunNextDispatchableMicrotask");
 				if (run_next_dispatchable_microtask) {
 					fn->Set(context, uni::NewLatin1Symbol(isolate, "__runNextDispatchable"),
@@ -1140,6 +1173,10 @@ Persistent<Function> Fiber::microtask_dispatcher;
 Persistent<Function> Fiber::run_dispatched;
 Persistent<ObjectTemplate> Fiber::token_template;
 double Fiber::microtasks_dispatched = 0;
+double Fiber::microtask_drains = 0;
+double Fiber::drains_with_dispatch = 0;
+double Fiber::redispatches = 0;
+double Fiber::last_dispatch_drain = -1;
 #endif
 bool did_init = false;
 
