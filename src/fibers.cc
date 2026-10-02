@@ -25,6 +25,24 @@ typedef bool (*RunNextDispatchableMicrotaskFn)(v8::Isolate*);
 static SetMicrotaskDispatchCallbackFn set_microtask_dispatch_callback = NULL;
 static RunDispatchedMicrotaskFn run_dispatched_microtask = NULL;
 static RunNextDispatchableMicrotaskFn run_next_dispatchable_microtask = NULL;
+
+// V8 keeps the continuation-preserved embedder data (CPED) slot per context up to V8 12, per
+// isolate from V8 13 (node 24). Only node 18 and node 24 are tested.
+static v8::Local<v8::Value> GetCped(v8::Isolate* isolate, v8::Local<v8::Context> context) {
+#if V8_AT_LEAST(13, 0)
+	return isolate->GetContinuationPreservedEmbedderData();
+#else
+	return context->GetContinuationPreservedEmbedderData();
+#endif
+}
+
+static void SetCped(v8::Isolate* isolate, v8::Local<v8::Context> context, v8::Local<v8::Value> value) {
+#if V8_AT_LEAST(13, 0)
+	isolate->SetContinuationPreservedEmbedderData(value);
+#else
+	context->SetContinuationPreservedEmbedderData(value);
+#endif
+}
 #endif
 
 #define THROW(x, m) return uni::Return(uni::ThrowException(Isolate::GetCurrent(), x(uni::NewLatin1String(Isolate::GetCurrent(), m))), args)
@@ -454,7 +472,6 @@ class Fiber {
 		static vector<Fiber*> orphaned_fibers;
 		static Persistent<Value> fatal_stack;
 #ifdef FIBERS_AWAIT_DISPATCH
-		static Persistent<Object> cped_marker;
 		static Persistent<Function> microtask_dispatcher;
 		static Persistent<Function> run_dispatched;
 		static Persistent<ObjectTemplate> token_template;
@@ -758,8 +775,11 @@ class Fiber {
 			Local<Value> previous_cped;
 			if (tag_reactions) {
 				cped_context = Local<Context>::New(isolate, v8_context);
-				previous_cped = cped_context->GetContinuationPreservedEmbedderData();
-				cped_context->SetContinuationPreservedEmbedderData(Local<Object>::New(isolate, cped_marker));
+				previous_cped = GetCped(isolate, cped_context);
+				// The marker is `true`: it lives in V8's read-only space and never moves. On V8 13 the
+				// slot is a GC root visited once per archived thread (one per fiber), and visiting a
+				// young object more than once in a scavenge corrupts the heap.
+				SetCped(isolate, cped_context, v8::True(isolate));
 			}
 #endif
 
@@ -773,7 +793,7 @@ class Fiber {
 
 #ifdef FIBERS_AWAIT_DISPATCH
 			if (tag_reactions) {
-				cped_context->SetContinuationPreservedEmbedderData(previous_cped);
+				SetCped(isolate, cped_context, previous_cped);
 			}
 #endif
 
@@ -993,6 +1013,16 @@ class Fiber {
 		}
 
 		/**
+		 * Fiber.__cpedInUse(): whether the CPED slot currently holds anything. Used to detect node 24's
+		 * AsyncContextFrame, which keeps AsyncLocalStorage state in the same slot.
+		 */
+		static uni::FunctionType CpedInUse(const uni::Arguments& args) {
+			Isolate* isolate = args.GetIsolate();
+			Local<Value> cped = GetCped(isolate, isolate->GetCurrentContext());
+			return uni::Return(uni::NewBoolean(isolate, !cped->IsUndefined()), args);
+		}
+
+		/**
 		 * Fiber.__setMicrotaskDispatcher(fn): fn(runDispatched, token) must call
 		 * runDispatched(token) synchronously, normally inside a new fiber.
 		 */
@@ -1079,10 +1109,11 @@ class Fiber {
 				Local<ObjectTemplate> token_tmpl = ObjectTemplate::New(isolate);
 				token_tmpl->SetInternalFieldCount(1);
 				token_template.Reset(isolate, token_tmpl);
-				cped_marker.Reset(isolate, Object::New(isolate));
 				run_dispatched.Reset(isolate, uni::GetFunction(uni::NewFunctionTemplate(isolate, RunDispatched)));
 				fn->Set(context, uni::NewLatin1Symbol(isolate, "__setMicrotaskDispatcher"),
 					uni::GetFunction(uni::NewFunctionTemplate(isolate, SetMicrotaskDispatcher))).FromJust();
+				fn->Set(context, uni::NewLatin1Symbol(isolate, "__cpedInUse"),
+					uni::GetFunction(uni::NewFunctionTemplate(isolate, CpedInUse))).FromJust();
 				uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "microtasksDispatched"), GetMicrotasksDispatched);
 				run_next_dispatchable_microtask = (RunNextDispatchableMicrotaskFn)dlsym(RTLD_DEFAULT, "v8_qualia_RunNextDispatchableMicrotask");
 				if (run_next_dispatchable_microtask) {
@@ -1105,7 +1136,6 @@ Fiber* Fiber::current = NULL;
 vector<Fiber*> Fiber::orphaned_fibers;
 Persistent<Value> Fiber::fatal_stack;
 #ifdef FIBERS_AWAIT_DISPATCH
-Persistent<Object> Fiber::cped_marker;
 Persistent<Function> Fiber::microtask_dispatcher;
 Persistent<Function> Fiber::run_dispatched;
 Persistent<ObjectTemplate> Fiber::token_template;
