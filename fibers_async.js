@@ -99,10 +99,24 @@ function asyncContextFrameInUse() {
   return inUse;
 }
 
+// Code after an `await` that blocked on the fiber we gave it (Future.wait, Promise.await, a sync
+// Meteor call). Without this dispatch it would have thrown "Can't wait without a fiber", so each one
+// marks code that still depends on fibers after an `await`. Counted once per job, when it first
+// parks; nothing is counted for the jobs that don't block. Kept on the native module, which every
+// copy of this file shares (an app can load more than one).
+_Fiber.__awaitContinuationBlocks = _Fiber.__awaitContinuationBlocks || 0;
+
 function dispatchOnNewFiber(runDispatched, token) {
-  const fiber = Fiber(() => runDispatched(token));
+  let finished = false;
+  const fiber = Fiber(() => {
+    runDispatched(token);
+    finished = true;
+  });
   fiber[kHidden] = true;
   fiber.run();
+  if (!finished) {
+    _Fiber.__awaitContinuationBlocks++;
+  }
 }
 
 // Runs jobs on one long-lived hidden fiber instead of a new fiber per job. After each job it keeps
@@ -148,6 +162,7 @@ function reusingDispatcher(runNextDispatchable) {
     if (fiber.run(token) !== kIdle && dispatchFiber === fiber) {
       // A job blocked on this fiber; it belongs to that job now.
       dispatchFiber = null;
+      _Fiber.__awaitContinuationBlocks++;
     }
   };
 }
@@ -155,6 +170,12 @@ function reusingDispatcher(runNextDispatchable) {
 Object.defineProperty(Fiber, 'microtasksBatched', {
   get() {
     return _Fiber.__microtasksBatched || 0;
+  }
+})
+
+Object.defineProperty(Fiber, 'awaitContinuationBlocks', {
+  get() {
+    return _Fiber.__awaitContinuationBlocks || 0;
   }
 })
 
