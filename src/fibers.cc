@@ -9,12 +9,24 @@
 
 // Prototype (Qualia): patched node exposes v8::SetMicrotaskDispatchCallback so the code after an
 // `await` (or a `.then` callback) registered inside a fiber also runs inside a fiber.
-#if defined(__has_include)
-#if __has_include(<v8-microtask-dispatch.h>)
-#include <v8-microtask-dispatch.h>
+//
+// The API is declared here rather than taken from the patched node's v8-microtask-dispatch.h:
+// node-gyp builds against the stock headers it downloads for the running version, and `make
+// install` doesn't ship that header, so gating on it compiled the feature out of every npm
+// install. Nothing here needs the header: the entry points are unmangled and looked up with
+// dlsym at load time, so the same binary runs with the feature on under the patched node and off
+// under a stock one. These declarations must match deps/v8/include/v8-microtask-dispatch.h in
+// qualialabs/node.
+#ifndef WINDOWS
 #include <dlfcn.h>
 #define FIBERS_AWAIT_DISPATCH 1
-#endif
+namespace v8 {
+	// Opaque handle to one promise reaction job taken out of the microtask queue.
+	struct DispatchedMicrotask;
+	// Return true to take ownership of |task| (and later call RunDispatchedMicrotask exactly
+	// once); false to have V8 run it inline.
+	using MicrotaskDispatchCallback = bool (*)(Isolate* isolate, DispatchedMicrotask* task, void* data);
+}
 #endif
 
 #ifdef FIBERS_AWAIT_DISPATCH
