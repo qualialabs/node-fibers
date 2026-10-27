@@ -73,6 +73,18 @@ function dispatchOnNewFiber(runDispatched, token) {
 // (it's parked inside that job), and the next dispatch starts a new one. FIBERS_AWAIT_REUSE=0 turns
 // this off.
 let microtasksBatched = 0;
+
+// The reused fiber runs continuations from unrelated requests one after another. Remove all own
+// properties of the fiber after each one, as meteor-promise's fiber pool does before returning a
+// fiber to the pool (fiber_pool.js), so nothing a continuation stores on the fiber reaches the next.
+// Like the pool, this leaves symbol-keyed properties (including kHidden) in place, and can't help
+// code that keys a WeakMap by the fiber: every continuation sees the same fiber object.
+function clearOwnProperties(fiber) {
+  Object.keys(fiber).forEach(function (key) {
+    delete fiber[key];
+  });
+}
+
 function reusingDispatcher(runNextDispatchable) {
   const kIdle = {};
   let reusableFiber = null;
@@ -83,10 +95,12 @@ function reusingDispatcher(runNextDispatchable) {
     const self = _Fiber.current;
     for (;;) {
       runDispatched(token);
+      clearOwnProperties(self);
       // Only while this is still the reusable fiber, i.e. we're nested inside the microtask loop.
       // A fiber that was parked by a job and later resumed must not pull in unrelated jobs.
       while (self === reusableFiber && runNextDispatchable()) {
         microtasksBatched++;
+        clearOwnProperties(self);
       }
       if (self !== reusableFiber) {
         return;
