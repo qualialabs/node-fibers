@@ -75,19 +75,20 @@ function dispatchOnNewFiber(runDispatched, token) {
 let microtasksBatched = 0;
 function reusingDispatcher(runNextDispatchable) {
   const kIdle = {};
-  let dispatchFiber = null;
+  let reusableFiber = null;
+  let reusableFiberRunning = false;
   let runDispatched;
 
   function dispatchLoop(token) {
     const self = _Fiber.current;
     for (;;) {
       runDispatched(token);
-      // Only while this is still the dispatch fiber, i.e. we're nested inside the microtask loop.
+      // Only while this is still the reusable fiber, i.e. we're nested inside the microtask loop.
       // A fiber that was parked by a job and later resumed must not pull in unrelated jobs.
-      while (self === dispatchFiber && runNextDispatchable()) {
+      while (self === reusableFiber && runNextDispatchable()) {
         microtasksBatched++;
       }
-      if (self !== dispatchFiber) {
+      if (self !== reusableFiber) {
         return;
       }
       token = _Fiber.yield(kIdle);
@@ -96,19 +97,32 @@ function reusingDispatcher(runNextDispatchable) {
 
   return function dispatchMicrotask(run, token) {
     runDispatched = run;
-    if (dispatchFiber && dispatchFiber === _Fiber.current) {
-      // A nested microtask drain on the dispatch fiber itself; we can't switch into a running fiber.
+    if (reusableFiberRunning) {
+      // Defensive: V8 doesn't start a microtask checkpoint during a drain, and the reusable fiber
+      // only runs inside one, so this isn't expected. If it happens, the fiber is somewhere on the
+      // stack (maybe below another fiber), and we can't switch into it.
       dispatchOnNewFiber(run, token);
       return;
     }
-    if (!dispatchFiber) {
-      dispatchFiber = Fiber(dispatchLoop);
-      dispatchFiber[kHidden] = true;
+    if (!reusableFiber) {
+      reusableFiber = Fiber(dispatchLoop);
+      reusableFiber[kHidden] = true;
     }
-    const fiber = dispatchFiber;
-    if (fiber.run(token) !== kIdle && dispatchFiber === fiber) {
+    const fiber = reusableFiber;
+    let result;
+    reusableFiberRunning = true;
+    try {
+      result = fiber.run(token);
+    } catch (e) {
+      // The fiber died (e.g. it was terminated); start a new one next time.
+      reusableFiber = null;
+      throw e;
+    } finally {
+      reusableFiberRunning = false;
+    }
+    if (result !== kIdle) {
       // A job blocked on this fiber; it belongs to that job now.
-      dispatchFiber = null;
+      reusableFiber = null;
     }
   };
 }
