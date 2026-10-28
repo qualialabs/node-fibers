@@ -1,0 +1,201 @@
+# Builds the prebuilt binaries the npm package ships in bin/, and packs them into the tarball to
+# publish. build.js uses a matching prebuilt binary instead of running node-gyp, so installs don't
+# need a compiler. That matters on Node >= 19 with npm 6: its bundled node-gyp 5 crashes there
+# ("Cannot assign to read only property 'cflags'"), so a missing binary means a failed install.
+#
+# To release: bump the version in package.json, commit, then push a tag v<version> on that commit.
+# This builds every binary, packs and checks the tarball, installs it on each Node version, and
+# then publishes it to CodeArtifact. Don't `npm publish` from a checkout: that packs no binaries.
+#
+# workflow_dispatch builds the tarball without publishing it. It only works once this file is on
+# the default branch, which here is upstream's master.
+name: Build prebuilt binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of qualialabs/node-fibers to build
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # The repo's .npmrc points at CodeArtifact, which these jobs have no credentials for. node-gyp and
+  # detect-libc come from the public registry instead.
+  NPM_REGISTRY: https://registry.npmjs.org/
+
+jobs:
+  build:
+    name: Build (node ${{ matrix.node }}, linux-x64)
+    runs-on: ubuntu-latest
+    # Debian bullseye has glibc 2.31, so the binaries load on anything newer (5.0.5's needed 2.34).
+    container: node:${{ matrix.node }}-bullseye
+    env:
+      # test.js fails a test on any stderr output, including Node deprecation warnings.
+      NODE_NO_WARNINGS: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        # The same Node versions 5.0.5 shipped binaries for.
+        node: [12, 14, 16, 18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install node-gyp and detect-libc
+        run: |
+          npm install -g node-gyp@9.4.1 --registry "$NPM_REGISTRY"
+          npm install --no-save --no-package-lock detect-libc@1.0.3 --registry "$NPM_REGISTRY"
+
+      - name: Build
+        run: |
+          node build.js -f
+          modules="$(node -p process.versions.modules)"
+          echo "MODULES=$modules" >> "$GITHUB_ENV"
+          ls -l "bin/linux-x64-$modules-glibc/fibers.node"
+
+      - name: Test
+        run: |
+          node quick-test.js | grep -qx pass
+          node test.js
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fibers-node-linux-x64-${{ env.MODULES }}
+          path: bin/linux-x64-${{ env.MODULES }}-glibc/fibers.node
+          if-no-files-found: error
+
+  package:
+    name: Pack the npm tarball
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+      version: ${{ steps.pack.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fibers-node-linux-x64-*
+          path: artifacts
+
+      - name: Put the binaries in bin/
+        run: |
+          for dir in artifacts/fibers-node-linux-x64-*; do
+            modules="${dir##*-}"
+            mkdir -p "bin/linux-x64-$modules-glibc"
+            cp "$dir/fibers.node" "bin/linux-x64-$modules-glibc/fibers.node"
+          done
+          ls -l bin/*/fibers.node
+
+      - name: Pack
+        id: pack
+        run: |
+          tarball="$(npm pack --silent)"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p 'require("./package.json").version')" >> "$GITHUB_OUTPUT"
+
+      - name: Check the tarball
+        # Files, binaries, glibc and await dispatch (see the script).
+        run: node scripts/check-package.js "${{ steps.pack.outputs.tarball }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.tarball }}
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+
+  verify:
+    name: Install the tarball (node ${{ matrix.node }}, npm ${{ matrix.npm }})
+    needs: package
+    runs-on: ubuntu-latest
+    container: node:${{ matrix.node }}-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [12, 14, 16, 18, 20, 22]
+        os: [bullseye]
+        npm: [bundled]
+        include:
+          # The setup that broke with 5.1.x: npm 6 (as scripts/build.mjs in qualia requires) on Node 22.
+          - { node: 22, os: bullseye, npm: 6 }
+          # The OS our node images are built on.
+          - { node: 18, os: bookworm, npm: bundled }
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.package.outputs.tarball }}
+
+      - name: Install npm 6
+        if: matrix.npm == '6'
+        run: npm install -g npm@6 --registry "$NPM_REGISTRY"
+
+      - name: Install without compiling
+        # build.js should find the prebuilt binary and skip node-gyp, which leaves no build/ directory
+        # behind. Warnings stay on (no NODE_NO_WARNINGS here), as in a real install.
+        run: |
+          mkdir app && cd app
+          npm install "../${{ needs.package.outputs.tarball }}" --no-package-lock --registry "$NPM_REGISTRY"
+          test ! -d node_modules/fibers/build || { echo "::error::fibers was compiled instead of using the prebuilt binary"; exit 1; }
+          node -e '
+            const Fiber = require("fibers");
+            Fiber(() => { if (Fiber.yield(1) !== 2) process.exit(1); }).run();
+            console.log(process.version, "ok; await dispatch available:", typeof Fiber.__setMicrotaskDispatcher === "function");
+          '
+
+  publish:
+    name: Publish to CodeArtifact
+    needs: [package, verify]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      CODEARTIFACT_REGISTRY: https://qualia-761015926586.d.codeartifact.us-west-2.amazonaws.com/npm/qualia-packages/
+    steps:
+      - name: Check the tag matches the version
+        run: |
+          if [ "${{ github.ref_name }}" != "v${{ needs.package.outputs.version }}" ]; then
+            echo "::error::tag ${{ github.ref_name }} doesn't match package.json version ${{ needs.package.outputs.version }}"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.package.outputs.tarball }}
+
+      # The same role and steps as shared-packages' publish.yml.
+      - name: Configure AWS credentials (CodeArtifact publish)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::761015926586:role/github-actions-codeartifact-publish-oidc-role
+          aws-region: us-west-2
+
+      - name: Set CodeArtifact auth
+        run: |
+          CODEARTIFACT_AUTH_TOKEN=$(aws codeartifact get-authorization-token --domain qualia --domain-owner 761015926586 --region us-west-2 --query authorizationToken --output text)
+          echo "::add-mask::$CODEARTIFACT_AUTH_TOKEN"
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/.npmrc-codeartifact"
+          {
+            echo "registry=$CODEARTIFACT_REGISTRY"
+            echo "//qualia-761015926586.d.codeartifact.us-west-2.amazonaws.com/npm/qualia-packages/:_authToken=${CODEARTIFACT_AUTH_TOKEN}"
+          } > "$NPM_CONFIG_USERCONFIG"
+          echo "NPM_CONFIG_USERCONFIG=$NPM_CONFIG_USERCONFIG" >> "$GITHUB_ENV"
+
+      - name: Publish
+        run: |
+          version="${{ needs.package.outputs.version }}"
+          if [ -n "$(npm view "fibers@$version" version --registry "$CODEARTIFACT_REGISTRY" 2>/dev/null)" ]; then
+            echo "::error::fibers@$version is already published"
+            exit 1
+          fi
+          npm publish "${{ needs.package.outputs.tarball }}" --registry "$CODEARTIFACT_REGISTRY"
