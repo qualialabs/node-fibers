@@ -7,6 +7,41 @@
 #include <vector>
 #include <iostream>
 
+// Prototype (Qualia): patched node exposes v8::SetMicrotaskDispatchCallback so the code after an
+// `await` (or a `.then` callback) registered inside a fiber also runs inside a fiber.
+//
+// The API is declared here rather than taken from the patched node's v8-microtask-dispatch.h:
+// node-gyp builds against the stock headers it downloads for the running version, and `make
+// install` doesn't ship that header, so gating on it compiled the feature out of every npm
+// install. Nothing here needs the header: the entry points are unmangled and looked up with
+// dlsym at load time, so the same binary runs with the feature on under the patched node and off
+// under a stock one. These declarations must match deps/v8/include/v8-microtask-dispatch.h in
+// qualialabs/node.
+//
+// Node 18 only: qualialabs/node only patches Node 18, and the CPED calls below are on v8::Context,
+// which V8 12 (Node 22) moved to v8::Isolate. Other versions build without the feature.
+#if !defined(WINDOWS) && NODE_MAJOR_VERSION == 18
+#include <dlfcn.h>
+#define FIBERS_AWAIT_DISPATCH 1
+namespace v8 {
+	// Opaque handle to one promise reaction job taken out of the microtask queue.
+	struct DispatchedMicrotask;
+	// Return true to take ownership of |task| (and later call RunDispatchedMicrotask exactly
+	// once); false to have V8 run it inline.
+	using MicrotaskDispatchCallback = bool (*)(Isolate* isolate, DispatchedMicrotask* task, void* data);
+}
+#endif
+
+#ifdef FIBERS_AWAIT_DISPATCH
+// Looked up at load time so this binary still works (with the feature off) on unpatched node.
+typedef void (*SetMicrotaskDispatchCallbackFn)(v8::Isolate*, v8::MicrotaskDispatchCallback, void*);
+typedef void (*RunDispatchedMicrotaskFn)(v8::Isolate*, v8::DispatchedMicrotask*);
+typedef bool (*RunNextDispatchableMicrotaskFn)(v8::Isolate*);
+static SetMicrotaskDispatchCallbackFn set_microtask_dispatch_callback = NULL;
+static RunDispatchedMicrotaskFn run_dispatched_microtask = NULL;
+static RunNextDispatchableMicrotaskFn run_next_dispatchable_microtask = NULL;
+#endif
+
 #define THROW(x, m) return uni::Return(uni::ThrowException(Isolate::GetCurrent(), x(uni::NewLatin1String(Isolate::GetCurrent(), m))), args)
 
 using namespace std;
@@ -415,6 +450,13 @@ class Fiber {
 		static Fiber* current;
 		static vector<Fiber*> orphaned_fibers;
 		static Persistent<Value> fatal_stack;
+#ifdef FIBERS_AWAIT_DISPATCH
+		static Persistent<Object> cped_marker;
+		static Persistent<Function> microtask_dispatcher;
+		static Persistent<Function> run_dispatched;
+		static Persistent<ObjectTemplate> token_template;
+		static double microtasks_dispatched;
+#endif
 
 		Isolate* isolate;
 		Persistent<Object> handle;
@@ -689,6 +731,21 @@ class Fiber {
 			Fiber* last_fiber = current;
 			current = this;
 
+#ifdef FIBERS_AWAIT_DISPATCH
+			// While this fiber runs, the context's continuation-preserved embedder data (CPED) is the
+			// marker. V8 copies CPED into every promise reaction registered meanwhile, and offers
+			// those reactions to DispatchMicrotask() instead of running them on whatever stack is
+			// draining the microtask queue.
+			bool tag_reactions = !microtask_dispatcher.IsEmpty();
+			Local<Context> cped_context;
+			Local<Value> previous_cped;
+			if (tag_reactions) {
+				cped_context = Local<Context>::New(isolate, v8_context);
+				previous_cped = cped_context->GetContinuationPreservedEmbedderData();
+				cped_context->SetContinuationPreservedEmbedderData(Local<Object>::New(isolate, cped_marker));
+			}
+#endif
+
 			// This will jump into either `RunFiber()` or `Yield()`, depending on if the fiber was
 			// already running.
 			{
@@ -696,6 +753,12 @@ class Fiber {
 				uni::ReverseIsolateScope isolate_scope(isolate);
 				this_fiber->run();
 			}
+
+#ifdef FIBERS_AWAIT_DISPATCH
+			if (tag_reactions) {
+				cped_context->SetContinuationPreservedEmbedderData(previous_cped);
+			}
+#endif
 
 			// At this point the fiber either returned or called `yield()`.
 			current = last_fiber;
@@ -858,6 +921,89 @@ class Fiber {
 			return uni::Return(uni::NewNumber(Isolate::GetCurrent(), Coroutine::coroutines_created()), info);
 		}
 
+#ifdef FIBERS_AWAIT_DISPATCH
+		/**
+		 * Called by V8 for a promise reaction (e.g. the code after an `await`) that was registered
+		 * while a fiber was running. Hands the job to the JS dispatcher, which runs it in a fiber.
+		 * Returns false (V8 runs the job inline) if the dispatcher didn't start it.
+		 */
+		static bool DispatchMicrotask(Isolate* isolate, v8::DispatchedMicrotask* task, void* data) {
+			if (microtask_dispatcher.IsEmpty()) {
+				return false;
+			}
+			HandleScope scope(isolate);
+			Local<Context> context = isolate->GetCurrentContext();
+			Local<Object> token;
+			if (!Local<ObjectTemplate>::New(isolate, token_template)->NewInstance(context).ToLocal(&token)) {
+				return false;
+			}
+			token->SetAlignedPointerInInternalField(0, task);
+			Local<Value> argv[2] = { Local<Function>::New(isolate, run_dispatched), token };
+			{
+				uni::TryCatch try_catch(isolate);
+				Local<Value> ignored;
+				if (!Local<Function>::New(isolate, microtask_dispatcher)->Call(context, Undefined(isolate), 2, argv).ToLocal(&ignored) && try_catch.HasCaught()) {
+					String::Utf8Value message(isolate, try_catch.Exception());
+					cerr << "fibers: microtask dispatcher threw: " << (*message ? *message : "<unknown>") << "\n";
+				}
+			}
+			if (token->GetAlignedPointerFromInternalField(0) != NULL) {
+				// Never started: make the token inert and let V8 run the job inline.
+				token->SetAlignedPointerInInternalField(0, NULL);
+				return false;
+			}
+			++microtasks_dispatched;
+			return true;
+		}
+
+		/**
+		 * runDispatched(token): runs the job behind `token` on the current stack. Only the first call
+		 * does anything.
+		 */
+		static uni::FunctionType RunDispatched(const uni::Arguments& args) {
+			Isolate* isolate = args.GetIsolate();
+			if (args.Length() != 1 || !args[0]->IsObject() || args[0].As<Object>()->InternalFieldCount() != 1) {
+				THROW(Exception::TypeError, "runDispatched expects a dispatch token");
+			}
+			Local<Object> token = args[0].As<Object>();
+			v8::DispatchedMicrotask* task = static_cast<v8::DispatchedMicrotask*>(token->GetAlignedPointerFromInternalField(0));
+			if (task != NULL) {
+				token->SetAlignedPointerInInternalField(0, NULL);
+				run_dispatched_microtask(isolate, task);
+			}
+			return uni::Return(uni::Undefined(isolate), args);
+		}
+
+		/**
+		 * Fiber.__setMicrotaskDispatcher(fn): fn(runDispatched, token) must call
+		 * runDispatched(token) synchronously, normally inside a new fiber.
+		 */
+		static uni::FunctionType SetMicrotaskDispatcher(const uni::Arguments& args) {
+			Isolate* isolate = args.GetIsolate();
+			if (args.Length() != 1 || !args[0]->IsFunction()) {
+				THROW(Exception::TypeError, "__setMicrotaskDispatcher expects a function");
+			}
+			microtask_dispatcher.Reset(isolate, args[0].As<Function>());
+			set_microtask_dispatch_callback(isolate, DispatchMicrotask, NULL);
+			return uni::Return(uni::Undefined(isolate), args);
+		}
+
+		/**
+		 * Fiber.__runNextDispatchable(): if the next queued microtask is also one that would be
+		 * dispatched, run it on the current stack and return true. Lets the dispatch fiber run a
+		 * run of such jobs without switching stacks for each one.
+		 */
+		static uni::FunctionType RunNextDispatchable(const uni::Arguments& args) {
+			Isolate* isolate = args.GetIsolate();
+			bool ran = run_next_dispatchable_microtask(isolate);
+			return uni::Return(uni::NewBoolean(isolate, ran), args);
+		}
+
+		static uni::FunctionType GetMicrotasksDispatched(Local<String> property, const uni::GetterCallbackInfo& info) {
+			return uni::Return(uni::NewNumber(Isolate::GetCurrent(), microtasks_dispatched), info);
+		}
+#endif
+
 	public:
 		/**
 		 * Initialize the Fiber library.
@@ -904,6 +1050,25 @@ class Fiber {
 			uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "current"), GetCurrent);
 			uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "poolSize"), GetPoolSize, SetPoolSize);
 			uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "fibersCreated"), GetFibersCreated);
+#ifdef FIBERS_AWAIT_DISPATCH
+			set_microtask_dispatch_callback = (SetMicrotaskDispatchCallbackFn)dlsym(RTLD_DEFAULT, "v8_qualia_SetMicrotaskDispatchCallback");
+			run_dispatched_microtask = (RunDispatchedMicrotaskFn)dlsym(RTLD_DEFAULT, "v8_qualia_RunDispatchedMicrotask");
+			if (set_microtask_dispatch_callback && run_dispatched_microtask) {
+				Local<ObjectTemplate> token_tmpl = ObjectTemplate::New(isolate);
+				token_tmpl->SetInternalFieldCount(1);
+				token_template.Reset(isolate, token_tmpl);
+				cped_marker.Reset(isolate, Object::New(isolate));
+				run_dispatched.Reset(isolate, uni::GetFunction(uni::NewFunctionTemplate(isolate, RunDispatched)));
+				fn->Set(context, uni::NewLatin1Symbol(isolate, "__setMicrotaskDispatcher"),
+					uni::GetFunction(uni::NewFunctionTemplate(isolate, SetMicrotaskDispatcher))).FromJust();
+				uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "microtasksDispatched"), GetMicrotasksDispatched);
+				run_next_dispatchable_microtask = (RunNextDispatchableMicrotaskFn)dlsym(RTLD_DEFAULT, "v8_qualia_RunNextDispatchableMicrotask");
+				if (run_next_dispatchable_microtask) {
+					fn->Set(context, uni::NewLatin1Symbol(isolate, "__runNextDispatchable"),
+						uni::GetFunction(uni::NewFunctionTemplate(isolate, RunNextDispatchable))).FromJust();
+				}
+			}
+#endif
 
 			// Global Fiber
 			target->Set(context, uni::NewLatin1Symbol(isolate, "Fiber"), fn).FromJust();
@@ -917,6 +1082,13 @@ Locker* Fiber::global_locker;
 Fiber* Fiber::current = NULL;
 vector<Fiber*> Fiber::orphaned_fibers;
 Persistent<Value> Fiber::fatal_stack;
+#ifdef FIBERS_AWAIT_DISPATCH
+Persistent<Object> Fiber::cped_marker;
+Persistent<Function> Fiber::microtask_dispatcher;
+Persistent<Function> Fiber::run_dispatched;
+Persistent<ObjectTemplate> Fiber::token_template;
+double Fiber::microtasks_dispatched = 0;
+#endif
 bool did_init = false;
 
 #if !NODE_VERSION_AT_LEAST(0,10,0)
