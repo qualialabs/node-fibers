@@ -17,7 +17,10 @@
 // dlsym at load time, so the same binary runs with the feature on under the patched node and off
 // under a stock one. These declarations must match deps/v8/include/v8-microtask-dispatch.h in
 // qualialabs/node.
-#ifndef WINDOWS
+//
+// Node 18 only: qualialabs/node only patches Node 18, and the CPED calls below are on v8::Context,
+// which V8 12 (Node 22) moved to v8::Isolate. Other versions build without the feature.
+#if !defined(WINDOWS) && NODE_MAJOR_VERSION == 18
 #include <dlfcn.h>
 #define FIBERS_AWAIT_DISPATCH 1
 namespace v8 {
