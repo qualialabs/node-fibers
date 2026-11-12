@@ -27,9 +27,14 @@ static RunDispatchedMicrotaskFn run_dispatched_microtask = NULL;
 static RunNextDispatchableMicrotaskFn run_next_dispatchable_microtask = NULL;
 
 // V8 keeps the continuation-preserved embedder data (CPED) slot per context up to V8 12, per
-// isolate from V8 13 (node 24). Only node 18 and node 24 are tested.
+// isolate from V8 13 (node 24). V8 14 (node 26) deprecates the Value-typed accessors in favour
+// of the V2 ones, which take and return v8::Data.
 static v8::Local<v8::Value> GetCped(v8::Isolate* isolate, v8::Local<v8::Context> context) {
-#if V8_AT_LEAST(13, 0)
+#if V8_AT_LEAST(14, 0)
+	v8::Local<v8::Data> data = isolate->GetContinuationPreservedEmbedderDataV2();
+	if (data.IsEmpty() || !data->IsValue()) return v8::Undefined(isolate);
+	return data.As<v8::Value>();
+#elif V8_AT_LEAST(13, 0)
 	return isolate->GetContinuationPreservedEmbedderData();
 #else
 	return context->GetContinuationPreservedEmbedderData();
@@ -37,7 +42,9 @@ static v8::Local<v8::Value> GetCped(v8::Isolate* isolate, v8::Local<v8::Context>
 }
 
 static void SetCped(v8::Isolate* isolate, v8::Local<v8::Context> context, v8::Local<v8::Value> value) {
-#if V8_AT_LEAST(13, 0)
+#if V8_AT_LEAST(14, 0)
+	isolate->SetContinuationPreservedEmbedderDataV2(value);
+#elif V8_AT_LEAST(13, 0)
 	isolate->SetContinuationPreservedEmbedderData(value);
 #else
 	context->SetContinuationPreservedEmbedderData(value);
@@ -223,11 +230,19 @@ namespace uni {
 
 	template <class T>
 	void SetInternalPointer(Local<T> handle, int index, void* val) {
+#if V8_AT_LEAST(14, 0)
+		handle->SetAlignedPointerInInternalField(index, val, v8::kEmbedderDataTypeTagDefault);
+#else
 		handle->SetAlignedPointerInInternalField(index, val);
+#endif
 	}
 	template <class T>
 	void* GetInternalPointer(Local<T> handle, int index) {
+#if V8_AT_LEAST(14, 0)
+		return handle->GetAlignedPointerFromInternalField(index, v8::kEmbedderDataTypeTagDefault);
+#else
 		return handle->GetAlignedPointerFromInternalField(index);
+#endif
 	}
 
 	template <class T>
@@ -924,6 +939,19 @@ class Fiber {
 		/**
 		 * Getters for `started`, and `current`.
 		 */
+#if V8_AT_LEAST(14, 0)
+		// V8 14 removed PropertyCallbackInfo::This(), and HolderV2() of a native data property is
+		// the prototype, not the fiber. `started` is a plain accessor property there instead.
+		static void GetStartedFn(const FunctionCallbackInfo<Value>& args) {
+			Local<Object> self = args.This();
+			if (self.IsEmpty() || self->InternalFieldCount() != 1) {
+				args.GetReturnValue().SetUndefined();
+				return;
+			}
+			Fiber& that = Unwrap(self);
+			args.GetReturnValue().Set(uni::NewBoolean(that.isolate, that.started));
+		}
+#else
 		static uni::FunctionType GetStarted(Local<String> property, const uni::GetterCallbackInfo& info) {
 			if (info.This().IsEmpty() || info.This()->InternalFieldCount() != 1) {
 				return uni::Return(uni::Undefined(Isolate::GetCurrent()), info);
@@ -931,6 +959,7 @@ class Fiber {
 			Fiber& that = Unwrap(info.This());
 			return uni::Return(uni::NewBoolean(that.isolate, that.started), info);
 		}
+#endif
 
 		static uni::FunctionType GetCurrent(Local<String> property, const uni::GetterCallbackInfo& info) {
 			if (current && !current->handle.IsEmpty()) {
@@ -975,7 +1004,7 @@ class Fiber {
 			if (!Local<ObjectTemplate>::New(isolate, token_template)->NewInstance(context).ToLocal(&token)) {
 				return false;
 			}
-			token->SetAlignedPointerInInternalField(0, task);
+			uni::SetInternalPointer(token, 0, task);
 			Local<Value> argv[2] = { Local<Function>::New(isolate, run_dispatched), token };
 			{
 				uni::TryCatch try_catch(isolate);
@@ -985,9 +1014,9 @@ class Fiber {
 					cerr << "fibers: microtask dispatcher threw: " << (*message ? *message : "<unknown>") << "\n";
 				}
 			}
-			if (token->GetAlignedPointerFromInternalField(0) != NULL) {
+			if (uni::GetInternalPointer(token, 0) != NULL) {
 				// Never started: make the token inert and let V8 run the job inline.
-				token->SetAlignedPointerInInternalField(0, NULL);
+				uni::SetInternalPointer(token, 0, NULL);
 				return false;
 			}
 			++microtasks_dispatched;
@@ -1004,9 +1033,9 @@ class Fiber {
 				THROW(Exception::TypeError, "runDispatched expects a dispatch token");
 			}
 			Local<Object> token = args[0].As<Object>();
-			v8::DispatchedMicrotask* task = static_cast<v8::DispatchedMicrotask*>(token->GetAlignedPointerFromInternalField(0));
+			v8::DispatchedMicrotask* task = static_cast<v8::DispatchedMicrotask*>(uni::GetInternalPointer(token, 0));
 			if (task != NULL) {
-				token->SetAlignedPointerInInternalField(0, NULL);
+				uni::SetInternalPointer(token, 0, NULL);
 				run_dispatched_microtask(isolate, task);
 			}
 			return uni::Return(uni::Undefined(isolate), args);
@@ -1085,7 +1114,10 @@ class Fiber {
 				uni::NewFunctionTemplate(isolate, Run, Local<Value>(), sig));
 			proto->Set(uni::NewLatin1Symbol(isolate, "throwInto"),
 				uni::NewFunctionTemplate(isolate, ThrowInto, Local<Value>(), sig));
-#if V8_AT_LEAST(13, 0)
+#if V8_AT_LEAST(14, 0)
+			proto->SetAccessorProperty(uni::NewLatin1Symbol(isolate, "started"),
+				uni::NewFunctionTemplate(isolate, GetStartedFn, Local<Value>(), sig));
+#elif V8_AT_LEAST(13, 0)
 			proto->SetNativeDataProperty(uni::NewLatin1Symbol(isolate, "started"), (AccessorNameGetterCallback)GetStarted);
 #else
 			proto->SetAccessor(uni::NewLatin1Symbol(isolate, "started"), GetStarted);
