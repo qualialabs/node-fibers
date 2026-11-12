@@ -154,7 +154,8 @@ Future.wait = function wait(/* ... */) {
 	}
 
 	// Resumes current fiber
-	var fiber = Fiber.current;
+	// Includes the hidden fibers that run code after an `await` (see fibers_async.js).
+	var fiber = Fiber.currentIncludingHidden || Fiber.current;
 	if (!fiber) {
 		throw new Error('Can\'t wait without a fiber. Most likely you called `Promise.await()` after calling `await somePromiseAPI()`. Read https://engdocs.qualia.io/qualia/advanced-topics/fibers');
 	}

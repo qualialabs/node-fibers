@@ -1,0 +1,7 @@
+# npm ignores .gitignore when this file exists, so repeat its rules.
+build/
+node_modules/
+
+# Release tooling, not part of the package.
+.github/
+scripts/

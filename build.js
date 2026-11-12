@@ -38,7 +38,9 @@ if (!force) {
 	try {
 		fs.statSync(path.join(__dirname, 'bin', modPath, 'fibers.node'));
 		console.log('`'+ modPath+ '` exists; testing');
-		cp.execFile(process.execPath, ['quick-test'], function(err, stdout, stderr) {
+		// --no-deprecation: fibers_sync.js uses process.binding('async_wrap'), which some Node versions
+		// warn about on stderr. That warning isn't a problem with the binary.
+		cp.execFile(process.execPath, ['--no-deprecation', 'quick-test'], function(err, stdout, stderr) {
 			if (err || stdout !== 'pass' || stderr) {
 				console.log('Problem with the binary; manual build incoming');
 				build();
@@ -95,7 +97,8 @@ function afterBuild() {
 	var installPath = path.join(__dirname, 'bin', modPath, 'fibers.node');
 
 	try {
-		fs.mkdirSync(path.join(__dirname, 'bin', modPath));
+		// recursive: a source-only package (no prebuilt binaries) has no bin/ directory at all
+		fs.mkdirSync(path.join(__dirname, 'bin', modPath), { recursive: true });
 	} catch (ex) {}
 
 	try {
