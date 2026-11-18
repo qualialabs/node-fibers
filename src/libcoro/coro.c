@@ -602,7 +602,7 @@ coro_destroy (coro_context *ctx)
 # undef CORO_GUARDPAGES
 #endif
 
-#if !__i386 && !__x86_64 && !__powerpc && !__m68k && !__alpha && !__mips && !__sparc64
+#if !__i386 && !__x86_64 && !__aarch64__ && !__powerpc && !__m68k && !__alpha && !__mips && !__sparc64
 # undef CORO_GUARDPAGES
 #endif
 
@@ -662,7 +662,13 @@ coro_stack_alloc (struct coro_stack *stack, unsigned int size)
       }
 
     #if CORO_GUARDPAGES
-      mprotect (base, CORO_GUARDPAGES * PAGESIZE, PROT_NONE);
+      /* Without the guard an overrun writes into the next mapping silently, so fail instead.
+         mprotect splits the mapping, which can hit vm.max_map_count. */
+      if (mprotect (base, CORO_GUARDPAGES * PAGESIZE, PROT_NONE))
+        {
+          munmap (base, ssze);
+          return 0;
+        }
     #endif
 
     base = (void*)((char *)base + CORO_GUARDPAGES * PAGESIZE);
