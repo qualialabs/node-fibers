@@ -1,3 +1,41 @@
+Qualia: publishing a release
+============================
+This fork is published to Qualia's CodeArtifact registry (`qualia-packages`) by the `Build prebuilt
+binaries` workflow (`.github/workflows/prebuild.yml`). Don't run `npm publish` from a checkout: that
+publishes a package without the prebuilt binaries, and installs that can't compile fibers then fail.
+
+1. Bump `version` in `package.json` and commit it, e.g. `chore(release): bump version to 5.1.3`.
+2. Push the branch, then tag that commit with the same version and push the tag:
+
+   ```sh
+   git tag v5.1.3
+   git push origin v5.1.3
+   ```
+
+3. Watch the run under Actions (`gh run watch -R qualialabs/node-fibers`). When every job passes,
+   `fibers@5.1.3` is published and becomes `latest`.
+4. Update the consumers to the new version: the Meteor services in `qualialabs/qualia` and any
+   packages in `qualialabs/shared-packages` that pin it.
+
+If the run fails, nothing is published:
+
+- **A build, test or install job failed:** fix it, then move the tag to the new commit
+  (`git tag -f v5.1.3 && git push -f origin v5.1.3`).
+- **"tag ... doesn't match package.json version":** tag the commit with `v` plus the exact version.
+- **"already published":** CodeArtifact won't take the same version twice. Bump the version and tag again.
+- **The AWS credentials step:** the publish role doesn't trust this repo or tag yet. Ask in
+  #ask-infra, and meanwhile publish the run's tarball by hand:
+
+  ```sh
+  gh run download <run-id> -R qualialabs/node-fibers -n fibers-5.1.3.tgz
+  aws codeartifact login --tool npm --domain qualia --domain-owner 761015926586 \
+    --repository qualia-packages --region us-west-2
+  node scripts/check-package.js fibers-5.1.3.tgz && npm publish fibers-5.1.3.tgz
+  ```
+
+To build the tarball without publishing it, run the workflow from the Actions tab
+(`workflow_dispatch`). That only works once the workflow file is on this repo's default branch.
+
 **NOTE OF OBSOLESCENCE** -- The author of this project recommends you avoid its use if possible. The
 original version of this module targeted nodejs v0.1.x in early 2011 when JavaScript on the server
 looked a lot different. Since then
