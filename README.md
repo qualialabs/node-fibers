@@ -13,7 +13,10 @@ publishes a package without the prebuilt binaries, and installs that can't compi
    ```
 
 3. Watch the run under Actions (`gh run watch -R qualialabs/node-fibers`). When every job passes,
-   `fibers@5.1.3` is published and becomes `latest`.
+   `fibers@5.1.3` is published under the dist-tag in `package.json`'s `publishConfig.tag`.
+   Each release line sets its own: `latest` on this 5.1.x line, `node26` on the 5.2.x `node26`
+   branch. npm needs it whenever a higher version is already published, and it keeps one line from
+   moving the other's tag. Keep it when merging between the branches.
 4. Update the consumers to the new version: the Meteor services in `qualialabs/qualia` and any
    packages in `qualialabs/shared-packages` that pin it.
 
