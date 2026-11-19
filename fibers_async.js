@@ -10,8 +10,10 @@ const asyncResourceWeakMap = new WeakMap();
 function Fiber(fn, ...args) {
   const ar = new AsyncResource('Fiber');
   const actualFn = (...args1) => ar.runInAsyncScope(() => {
+    // _Fiber.current: Fiber.current hides the fibers that run code after an await.
     _Fiber.current._meteor_dynamics = undefined;
-    fn(...args1);
+    // return the fiber function's value so run() resolves to it when the fiber finishes (fibers README semantics)
+    return fn(...args1);
   });
   const _fiber = _Fiber(actualFn, ...args);
   asyncResourceWeakMap.set(_fiber, ar);
@@ -40,6 +42,19 @@ Object.defineProperty(Fiber, 'currentIncludingHidden', {
   }
 })
 
+// poolSize is a native data property on the native constructor. On V8 >= 13 (node 24) assigning
+// `Fiber.poolSize = n` on this wrapper no longer reaches that setter: it creates an own property on
+// the wrapper and the native pool size silently stays at its default (120). Forward it explicitly,
+// which is also what happened implicitly on node 18.
+Object.defineProperty(Fiber, 'poolSize', {
+  get() {
+    return _Fiber.poolSize;
+  },
+  set(value) {
+    _Fiber.poolSize = value;
+  },
+})
+
 
 _Fiber.prototype.runInAsyncScope = function runInAsyncScope(fn) {
   return asyncResourceWeakMap.get(this).runInAsyncScope(fn);
@@ -54,11 +69,34 @@ _Fiber[Symbol.hasInstance] = function(obj) {
 // an `await`) that was registered inside a fiber. Run it in a hidden fiber so it can still block.
 // The job's own promise hooks restore its async context inside the fiber.
 // FIBERS_AWAIT_DISPATCH=0 turns this off.
-if (typeof _Fiber.__setMicrotaskDispatcher === 'function' && process.env.FIBERS_AWAIT_DISPATCH !== '0') {
+_Fiber.awaitDispatchEnabled = false;
+if (typeof _Fiber.__setMicrotaskDispatcher === 'function' && process.env.FIBERS_AWAIT_DISPATCH !== '0'
+    && !asyncContextFrameInUse()) {
+  _Fiber.awaitDispatchEnabled = true;
   const runNextDispatchable = process.env.FIBERS_AWAIT_REUSE !== '0' ? _Fiber.__runNextDispatchable : undefined;
   _Fiber.__setMicrotaskDispatcher(typeof runNextDispatchable === 'function'
     ? reusingDispatcher(runNextDispatchable)
     : dispatchOnNewFiber);
+}
+
+// Node 24's AsyncContextFrame (on by default) keeps AsyncLocalStorage state in the V8 slot we tag
+// reactions with, so dispatch needs `--no-async-context-frame` (fibers needs it on node 24 anyway).
+// Quiet unless FIBERS_AWAIT_DISPATCH=1 asks for dispatch: helper processes (build tools, child
+// processes) load fibers without the flag. Fiber.awaitDispatchEnabled tells you which way it went.
+function asyncContextFrameInUse() {
+  if (typeof _Fiber.__cpedInUse !== 'function') {
+    return false;
+  }
+  const { AsyncLocalStorage } = require('async_hooks');
+  const probe = new AsyncLocalStorage();
+  const inUse = probe.run(true, () => _Fiber.__cpedInUse());
+  // Without AsyncContextFrame, an AsyncLocalStorage turns on promise hooks for the whole process
+  // (every promise pays for them); disabling the probe turns them off again if nothing else uses one.
+  probe.disable();
+  if (inUse && process.env.FIBERS_AWAIT_DISPATCH === '1') {
+    console.warn('[fibers] not running await continuations on fibers: AsyncContextFrame is on (start node with --no-async-context-frame)');
+  }
+  return inUse;
 }
 
 function dispatchOnNewFiber(runDispatched, token) {
@@ -72,7 +110,8 @@ function dispatchOnNewFiber(runDispatched, token) {
 // one switch onto the fiber and one back, not two per `await`. A job that blocks keeps the fiber
 // (it's parked inside that job), and the next dispatch starts a new one. FIBERS_AWAIT_REUSE=0 turns
 // this off.
-let microtasksBatched = 0;
+// Kept on the native module, which every copy of this file shares (an app can load more than one).
+_Fiber.__microtasksBatched = _Fiber.__microtasksBatched || 0;
 
 // The reused fiber runs continuations from unrelated requests one after another. Remove all own
 // properties of the fiber after each one, as meteor-promise's fiber pool does before returning a
@@ -99,7 +138,7 @@ function reusingDispatcher(runNextDispatchable) {
       // Only while this is still the reusable fiber, i.e. we're nested inside the microtask loop.
       // A fiber that was parked by a job and later resumed must not pull in unrelated jobs.
       while (self === reusableFiber && runNextDispatchable()) {
-        microtasksBatched++;
+        _Fiber.__microtasksBatched++;
         clearOwnProperties(self);
       }
       if (self !== reusableFiber) {
@@ -143,7 +182,7 @@ function reusingDispatcher(runNextDispatchable) {
 
 Object.defineProperty(Fiber, 'microtasksBatched', {
   get() {
-    return microtasksBatched;
+    return _Fiber.__microtasksBatched || 0;
   }
 })
 

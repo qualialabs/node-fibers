@@ -18,9 +18,10 @@
 // under a stock one. These declarations must match deps/v8/include/v8-microtask-dispatch.h in
 // qualialabs/node.
 //
-// Node 18 only: qualialabs/node only patches Node 18, and the CPED calls below are on v8::Context,
-// which V8 12 (Node 22) moved to v8::Isolate. Other versions build without the feature.
-#if !defined(WINDOWS) && NODE_MAJOR_VERSION == 18
+// qualialabs/node patches Node 18 (V8 10.2) and Node 26 (V8 14). Node 20 and 22 (V8 11/12) are not
+// patched and keep the CPED slot where the helpers below don't look, so they build without the
+// feature. Node 24 (V8 13) was patched too and still builds with it.
+#if !defined(WINDOWS) && (NODE_MAJOR_VERSION == 18 || V8_AT_LEAST(13, 0))
 #include <dlfcn.h>
 #define FIBERS_AWAIT_DISPATCH 1
 namespace v8 {
@@ -40,6 +41,31 @@ typedef bool (*RunNextDispatchableMicrotaskFn)(v8::Isolate*);
 static SetMicrotaskDispatchCallbackFn set_microtask_dispatch_callback = NULL;
 static RunDispatchedMicrotaskFn run_dispatched_microtask = NULL;
 static RunNextDispatchableMicrotaskFn run_next_dispatchable_microtask = NULL;
+
+// V8 keeps the continuation-preserved embedder data (CPED) slot per context up to V8 12, per
+// isolate from V8 13 (node 24). V8 14 (node 26) deprecates the Value-typed accessors in favour
+// of the V2 ones, which take and return v8::Data.
+static v8::Local<v8::Value> GetCped(v8::Isolate* isolate, v8::Local<v8::Context> context) {
+#if V8_AT_LEAST(14, 0)
+	v8::Local<v8::Data> data = isolate->GetContinuationPreservedEmbedderDataV2();
+	if (data.IsEmpty() || !data->IsValue()) return v8::Undefined(isolate);
+	return data.As<v8::Value>();
+#elif V8_AT_LEAST(13, 0)
+	return isolate->GetContinuationPreservedEmbedderData();
+#else
+	return context->GetContinuationPreservedEmbedderData();
+#endif
+}
+
+static void SetCped(v8::Isolate* isolate, v8::Local<v8::Context> context, v8::Local<v8::Value> value) {
+#if V8_AT_LEAST(14, 0)
+	isolate->SetContinuationPreservedEmbedderDataV2(value);
+#elif V8_AT_LEAST(13, 0)
+	isolate->SetContinuationPreservedEmbedderData(value);
+#else
+	context->SetContinuationPreservedEmbedderData(value);
+#endif
+}
 #endif
 
 #define THROW(x, m) return uni::Return(uni::ThrowException(Isolate::GetCurrent(), x(uni::NewLatin1String(Isolate::GetCurrent(), m))), args)
@@ -220,11 +246,19 @@ namespace uni {
 
 	template <class T>
 	void SetInternalPointer(Local<T> handle, int index, void* val) {
+#if V8_AT_LEAST(14, 0)
+		handle->SetAlignedPointerInInternalField(index, val, v8::kEmbedderDataTypeTagDefault);
+#else
 		handle->SetAlignedPointerInInternalField(index, val);
+#endif
 	}
 	template <class T>
 	void* GetInternalPointer(Local<T> handle, int index) {
+#if V8_AT_LEAST(14, 0)
+		return handle->GetAlignedPointerFromInternalField(index, v8::kEmbedderDataTypeTagDefault);
+#else
 		return handle->GetAlignedPointerFromInternalField(index);
+#endif
 	}
 
 	template <class T>
@@ -237,11 +271,13 @@ namespace uni {
 		args.GetReturnValue().Set(handle);
 	}
 	template <class T>
-	void Return(Local<T> handle, GetterCallbackInfo info) {
+	// PropertyCallbackInfo must be taken by reference: since V8 13 it holds the argument slots inline,
+	// so GetReturnValue().Set() on a by-value copy is silently lost.
+	void Return(Local<T> handle, const GetterCallbackInfo& info) {
 		info.GetReturnValue().Set(handle);
 	}
 	template <class T>
-	void Return(Persistent<T>& handle, GetterCallbackInfo info) {
+	void Return(Persistent<T>& handle, const GetterCallbackInfo& info) {
 		info.GetReturnValue().Set(Local<T>::New(Isolate::GetCurrent(), handle));
 	}
 
@@ -392,7 +428,23 @@ namespace uni {
 	}
 #endif
 
-#if V8_AT_LEAST(6, 1)
+#if V8_AT_LEAST(13, 0)
+	// FunctionCallbackInfo::Holder() was removed in V8 13; This() is the documented replacement.
+	inline Local<Object> Holder(const FunctionCallbackInfo<Value>& args) { return args.This(); }
+#else
+	inline Local<Object> Holder(const FunctionCallbackInfo<Value>& args) { return args.Holder(); }
+#endif
+
+#if V8_AT_LEAST(13, 0)
+	// ObjectTemplate::SetAccessor / Object::SetAccessor were removed in V8 13; SetNativeDataProperty is the replacement.
+	void SetAccessor(
+		Isolate* isolate, Local<Object> object, Local<String> name,
+		FunctionType (*getter)(Local<String>, const GetterCallbackInfo&),
+		void (*setter)(Local<String> property, Local<Value> value, const SetterCallbackInfo&) = 0
+	) {
+		object->SetNativeDataProperty(isolate->GetCurrentContext(), name, (AccessorNameGetterCallback)getter, (AccessorNameSetterCallback)setter).ToChecked();
+	}
+#elif V8_AT_LEAST(6, 1)
 	void SetAccessor(
 		Isolate* isolate, Local<Object> object, Local<String> name,
 		FunctionType (*getter)(Local<String>, const GetterCallbackInfo&),
@@ -451,7 +503,6 @@ class Fiber {
 		static vector<Fiber*> orphaned_fibers;
 		static Persistent<Value> fatal_stack;
 #ifdef FIBERS_AWAIT_DISPATCH
-		static Persistent<Object> cped_marker;
 		static Persistent<Function> microtask_dispatcher;
 		static Persistent<Function> run_dispatched;
 		static Persistent<ObjectTemplate> token_template;
@@ -504,6 +555,7 @@ class Fiber {
 		 * i.e. After fiber completes, while yielded, or before started
 		 */
 		void MakeWeak() {
+			if (handle.IsEmpty()) return; // garbage-collected fiber being unwound as a zombie
 			uni::MakeWeak<WeakCallback>(isolate, handle, (void*)this);
 		}
 
@@ -512,6 +564,7 @@ class Fiber {
 		 * i.e. While running.
 		 */
 		void ClearWeak() {
+			if (handle.IsEmpty()) return; // see MakeWeak()
 			handle.ClearWeak();
 		}
 
@@ -532,7 +585,14 @@ class Fiber {
 			if (that.started) {
 				assert(that.yielding);
 				orphaned_fibers.push_back(&that);
+#if V8_AT_LEAST(10, 4)
+				// kParameter is a phantom callback: V8 has already reclaimed the JS object and CHECKs that
+				// the handle was reset before this callback returns ("Handle not reset in first callback").
+				// The fiber is unwound and deleted by DestroyOrphans; there is no JS object to hand back.
+				uni::Dispose(that.isolate, that.handle);
+#else
 				that.ClearWeak();
+#endif
 				return;
 			}
 
@@ -574,7 +634,12 @@ class Fiber {
 				}
 
 				uni::Dispose(that.isolate, that.yielded);
+#if V8_AT_LEAST(10, 4)
+				// The JS object is gone (see WeakCallback); nothing can reference this fiber again.
+				delete &that;
+#else
 				that.MakeWeak();
+#endif
 			}
 		}
 
@@ -602,7 +667,7 @@ class Fiber {
 		 * be created and the callback will start. Otherwise we switch back into the exist context.
 		 */
 		static uni::FunctionType Run(const uni::Arguments& args) {
-			Fiber& that = Unwrap(args.Holder());
+			Fiber& that = Unwrap(uni::Holder(args));
 
 			// There seems to be no better place to put this check..
 			DestroyOrphans();
@@ -643,7 +708,7 @@ class Fiber {
 		 * Throw an exception into a currently yielding fiber.
 		 */
 		static uni::FunctionType ThrowInto(const uni::Arguments& args) {
-			Fiber& that = Unwrap(args.Holder());
+			Fiber& that = Unwrap(uni::Holder(args));
 
 			if (!that.yielding) {
 				THROW(Exception::Error, "This Fiber is not yielding");
@@ -664,7 +729,7 @@ class Fiber {
 		 * effect.
 		 */
 		static uni::FunctionType Reset(const uni::Arguments& args) {
-			Fiber& that = Unwrap(args.Holder());
+			Fiber& that = Unwrap(uni::Holder(args));
 
 			if (!that.started) {
 				return uni::Return(uni::Undefined(that.isolate), args);
@@ -741,8 +806,11 @@ class Fiber {
 			Local<Value> previous_cped;
 			if (tag_reactions) {
 				cped_context = Local<Context>::New(isolate, v8_context);
-				previous_cped = cped_context->GetContinuationPreservedEmbedderData();
-				cped_context->SetContinuationPreservedEmbedderData(Local<Object>::New(isolate, cped_marker));
+				previous_cped = GetCped(isolate, cped_context);
+				// The marker is `true`: it lives in V8's read-only space and never moves. On V8 13 the
+				// slot is a GC root visited once per archived thread (one per fiber), and visiting a
+				// young object more than once in a scavenge corrupts the heap.
+				SetCped(isolate, cped_context, v8::True(isolate));
 			}
 #endif
 
@@ -756,7 +824,7 @@ class Fiber {
 
 #ifdef FIBERS_AWAIT_DISPATCH
 			if (tag_reactions) {
-				cped_context->SetContinuationPreservedEmbedderData(previous_cped);
+				SetCped(isolate, cped_context, previous_cped);
 			}
 #endif
 
@@ -889,6 +957,19 @@ class Fiber {
 		/**
 		 * Getters for `started`, and `current`.
 		 */
+#if V8_AT_LEAST(14, 0)
+		// V8 14 removed PropertyCallbackInfo::This(), and HolderV2() of a native data property is
+		// the prototype, not the fiber. `started` is a plain accessor property there instead.
+		static void GetStartedFn(const FunctionCallbackInfo<Value>& args) {
+			Local<Object> self = args.This();
+			if (self.IsEmpty() || self->InternalFieldCount() != 1) {
+				args.GetReturnValue().SetUndefined();
+				return;
+			}
+			Fiber& that = Unwrap(self);
+			args.GetReturnValue().Set(uni::NewBoolean(that.isolate, that.started));
+		}
+#else
 		static uni::FunctionType GetStarted(Local<String> property, const uni::GetterCallbackInfo& info) {
 			if (info.This().IsEmpty() || info.This()->InternalFieldCount() != 1) {
 				return uni::Return(uni::Undefined(Isolate::GetCurrent()), info);
@@ -896,9 +977,11 @@ class Fiber {
 			Fiber& that = Unwrap(info.This());
 			return uni::Return(uni::NewBoolean(that.isolate, that.started), info);
 		}
+#endif
 
 		static uni::FunctionType GetCurrent(Local<String> property, const uni::GetterCallbackInfo& info) {
-			if (current) {
+			if (current && !current->handle.IsEmpty()) {
+				// The handle is empty while a garbage-collected fiber is being unwound as a zombie.
 				return uni::Return(current->handle, info);
 			} else {
 				return uni::Return(uni::Undefined(Isolate::GetCurrent()), info);
@@ -939,7 +1022,7 @@ class Fiber {
 			if (!Local<ObjectTemplate>::New(isolate, token_template)->NewInstance(context).ToLocal(&token)) {
 				return false;
 			}
-			token->SetAlignedPointerInInternalField(0, task);
+			uni::SetInternalPointer(token, 0, task);
 			Local<Value> argv[2] = { Local<Function>::New(isolate, run_dispatched), token };
 			{
 				uni::TryCatch try_catch(isolate);
@@ -949,9 +1032,9 @@ class Fiber {
 					cerr << "fibers: microtask dispatcher threw: " << (*message ? *message : "<unknown>") << "\n";
 				}
 			}
-			if (token->GetAlignedPointerFromInternalField(0) != NULL) {
+			if (uni::GetInternalPointer(token, 0) != NULL) {
 				// Never started: make the token inert and let V8 run the job inline.
-				token->SetAlignedPointerInInternalField(0, NULL);
+				uni::SetInternalPointer(token, 0, NULL);
 				return false;
 			}
 			++microtasks_dispatched;
@@ -968,12 +1051,22 @@ class Fiber {
 				THROW(Exception::TypeError, "runDispatched expects a dispatch token");
 			}
 			Local<Object> token = args[0].As<Object>();
-			v8::DispatchedMicrotask* task = static_cast<v8::DispatchedMicrotask*>(token->GetAlignedPointerFromInternalField(0));
+			v8::DispatchedMicrotask* task = static_cast<v8::DispatchedMicrotask*>(uni::GetInternalPointer(token, 0));
 			if (task != NULL) {
-				token->SetAlignedPointerInInternalField(0, NULL);
+				uni::SetInternalPointer(token, 0, NULL);
 				run_dispatched_microtask(isolate, task);
 			}
 			return uni::Return(uni::Undefined(isolate), args);
+		}
+
+		/**
+		 * Fiber.__cpedInUse(): whether the CPED slot currently holds anything. Used to detect node 24's
+		 * AsyncContextFrame, which keeps AsyncLocalStorage state in the same slot.
+		 */
+		static uni::FunctionType CpedInUse(const uni::Arguments& args) {
+			Isolate* isolate = args.GetIsolate();
+			Local<Value> cped = GetCped(isolate, isolate->GetCurrentContext());
+			return uni::Return(uni::NewBoolean(isolate, !cped->IsUndefined()), args);
 		}
 
 		/**
@@ -1039,7 +1132,14 @@ class Fiber {
 				uni::NewFunctionTemplate(isolate, Run, Local<Value>(), sig));
 			proto->Set(uni::NewLatin1Symbol(isolate, "throwInto"),
 				uni::NewFunctionTemplate(isolate, ThrowInto, Local<Value>(), sig));
+#if V8_AT_LEAST(14, 0)
+			proto->SetAccessorProperty(uni::NewLatin1Symbol(isolate, "started"),
+				uni::NewFunctionTemplate(isolate, GetStartedFn, Local<Value>(), sig));
+#elif V8_AT_LEAST(13, 0)
+			proto->SetNativeDataProperty(uni::NewLatin1Symbol(isolate, "started"), (AccessorNameGetterCallback)GetStarted);
+#else
 			proto->SetAccessor(uni::NewLatin1Symbol(isolate, "started"), GetStarted);
+#endif
 
 			// Global yield() function
 			Local<Function> yield = uni::GetFunction(uni::NewFunctionTemplate(isolate, Yield_));
@@ -1059,10 +1159,11 @@ class Fiber {
 				Local<ObjectTemplate> token_tmpl = ObjectTemplate::New(isolate);
 				token_tmpl->SetInternalFieldCount(1);
 				token_template.Reset(isolate, token_tmpl);
-				cped_marker.Reset(isolate, Object::New(isolate));
 				run_dispatched.Reset(isolate, uni::GetFunction(uni::NewFunctionTemplate(isolate, RunDispatched)));
 				fn->Set(context, uni::NewLatin1Symbol(isolate, "__setMicrotaskDispatcher"),
 					uni::GetFunction(uni::NewFunctionTemplate(isolate, SetMicrotaskDispatcher))).FromJust();
+				fn->Set(context, uni::NewLatin1Symbol(isolate, "__cpedInUse"),
+					uni::GetFunction(uni::NewFunctionTemplate(isolate, CpedInUse))).FromJust();
 				uni::SetAccessor(isolate, fn, uni::NewLatin1Symbol(isolate, "microtasksDispatched"), GetMicrotasksDispatched);
 				run_next_dispatchable_microtask = (RunNextDispatchableMicrotaskFn)dlsym(RTLD_DEFAULT, "v8_qualia_RunNextDispatchableMicrotask");
 				if (run_next_dispatchable_microtask) {
@@ -1085,7 +1186,6 @@ Fiber* Fiber::current = NULL;
 vector<Fiber*> Fiber::orphaned_fibers;
 Persistent<Value> Fiber::fatal_stack;
 #ifdef FIBERS_AWAIT_DISPATCH
-Persistent<Object> Fiber::cped_marker;
 Persistent<Function> Fiber::microtask_dispatcher;
 Persistent<Function> Fiber::run_dispatched;
 Persistent<ObjectTemplate> Fiber::token_template;

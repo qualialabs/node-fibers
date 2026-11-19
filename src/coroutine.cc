@@ -210,13 +210,16 @@ Coroutine::Coroutine(entry_t& entry, void* arg) :
 }
 
 Coroutine::~Coroutine() {
-	if (stack.sptr) {
-		coro_stack_free(&stack);
-	}
+	// Destroy the context before freeing the stack: with CORO_PTHREAD the coroutine is an OS thread
+	// whose struct pthread glibc places at the top of the user-supplied stack, so coro_destroy's
+	// pthread_cancel/pthread_join must run while that memory is still mapped.
 #ifdef CORO_FIBER
 	if (context.fiber)
 #endif
 	(void)coro_destroy(&context);
+	if (stack.sptr) {
+		coro_stack_free(&stack);
+	}
 }
 
 Coroutine* Coroutine::create_fiber(entry_t* entry, void* arg) {
