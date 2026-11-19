@@ -793,9 +793,11 @@ class Fiber {
 				Isolate::Scope isolate_scope(that.isolate);
 				uni::HandleScope scope(that.isolate);
 
-				// Set the stack guard for this "thread"; allow 6k of padding past the JS limit for
-				// native v8 code to run
-				uni::SetStackGuard(that.isolate, reinterpret_cast<char*>(that.this_fiber->bottom()) + 1024 * 6);
+				// Set the stack guard for this "thread". V8's limit only bounds JS frames, so the
+				// space below it is all the native code called from JS at the limit gets. Single
+				// unprobed Node frames are already 16.5 KB (`StreamBase::WriteString`), so leave
+				// 192 KiB, the same reserve Node keeps for Worker threads (PSEC-2901).
+				uni::SetStackGuard(that.isolate, reinterpret_cast<char*>(that.this_fiber->bottom()) + 1024 * 192);
 
 				uni::TryCatch try_catch(that.isolate);
 				that.ClearWeak();
@@ -1106,8 +1108,9 @@ void init(Local<Object> target) {
 	uni::HandleScope scope(isolate);
 	Coroutine::init(isolate);
 	Fiber::Init(target);
-	// Default stack size of either 512k or 1M. Perhaps make this configurable by the run time?
-	Coroutine::set_stack_size(128 * 1024);
+	// Stack size in pointer-sized words: 1.25 MiB on 64-bit. The extra 256 KiB over the old 1 MiB
+	// pays for the 192 KiB native reserve below V8's limit, so JS recursion depth stays the same.
+	Coroutine::set_stack_size(160 * 1024);
 }
 
 NODE_MODULE(fibers, init)

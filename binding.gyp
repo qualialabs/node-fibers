@@ -34,7 +34,10 @@
 					{'defines': ['CORO_FIBER', 'WINDOWS']},
 				# else
 					{
-						'defines': ['USE_CORO', 'CORO_GUARDPAGES=1'],
+						# 5 pages (20 KiB) is more than the largest unprobed native frame Node pushes
+						# (16.5 KB, StreamBase::WriteString), so an overrun faults instead of skipping
+						# the guard (PSEC-2901).
+						'defines': ['USE_CORO', 'CORO_GUARDPAGES=5'],
 						'ldflags': ['-pthread'],
 					}
 				],
