@@ -28,6 +28,9 @@
 	"engines": {
 		"node": ">=10.0.0"
 	},
+	"publishConfig": {
+		"tag": "latest"
+	},
 	"dependencies": {
 		"detect-libc": "^1.0.3"
 	}

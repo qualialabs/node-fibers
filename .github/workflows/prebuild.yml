@@ -202,4 +202,5 @@ jobs:
             echo "::error::fibers@$version is already published"
             exit 1
           fi
+          # The dist-tag comes from publishConfig.tag in the tarball's package.json.
           npm publish "${{ needs.package.outputs.tarball }}" --registry "$CODEARTIFACT_REGISTRY"
