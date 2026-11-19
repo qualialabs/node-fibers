@@ -121,13 +121,16 @@ function setupAsyncHacks(Fiber) {
 			};
 		}
 
-		// Monkey patch methods which may long jump
+		// Monkey patch methods which may long jump. Every method that switches to another fiber must
+		// be wrapped, so the other fiber never runs on top of the caller's async context.
 		Fiber.yield = wrapFunction(Fiber.yield, "Fiber.yield");
 		Fiber.prototype.run = wrapFunction(Fiber.prototype.run, "Fiber.run");
 		Fiber.prototype.throwInto = wrapFunction(
 			Fiber.prototype.throwInto,
 			"Fiber.throwInto"
 		);
+		// reset() switches into a yielded fiber to unwind it (PSEC-2903).
+		Fiber.prototype.reset = wrapFunction(Fiber.prototype.reset, "Fiber.reset");
 
 	} catch (err) {
 		return;
